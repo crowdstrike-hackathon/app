@@ -18,7 +18,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="Sentinel — Agentic Red/Blue SOC Simulation",
+    title="Riposte — Agentic Red/Blue SOC Simulation",
     version="0.2.0",
     description="Charlotte-style defender AI, pressure-tested by an adversary AI, at scale.",
     lifespan=lifespan,

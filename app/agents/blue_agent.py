@@ -105,7 +105,7 @@ def heuristic_investigate(turn: int, events: list[LogEvent]) -> Investigation:
 
 
 BLUE_SYSTEM = (
-    "You are Sentinel, an autonomous SOC analyst (blue team) in a simulated exercise. "
+    "You are Riposte, an autonomous SOC analyst (blue team) in a simulated exercise. "
     "You are given a stream of security logs. SOME LOGS ARE ADVERSARY DECEPTION: spoofed "
     "sources, tampered timestamps, planted lures, or benign noise meant to mislead you. You "
     "are NOT told which. Reason carefully; trust corroborated cross-domain signal over any "
