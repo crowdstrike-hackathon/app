@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+.env.local
+*.log
+.DS_Store
+.pytest_cache/
+*.db
+sentinel.db
