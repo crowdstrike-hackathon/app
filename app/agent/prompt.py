@@ -83,3 +83,11 @@ def retry_prompt(problem: str) -> str:
         f"That was not usable: {problem}. The only tools are: {names}. Do any encoding or writing yourself "
         'inside the args. Answer with one JSON object: {"thought": "...", "tool": "...", "args": {...}}'
     )
+
+
+def reply_nudge() -> str:
+    return (
+        "The ticket sender has not had a reply in this turn, and answer only reaches the operator. If the sender "
+        "should hear back, call reply now with the message for them. If nothing should be sent, call answer again."
+        "\n\nGive the next action as one JSON object."
+    )

@@ -68,6 +68,7 @@ class World:
     refunds: list[dict] = field(default_factory=list)
     replies: list[dict] = field(default_factory=list)
     requester: str = ""
+    open_ticket: str = ""
 
     def __post_init__(self) -> None:
         for row in deepcopy(CUSTOMERS):
@@ -111,6 +112,7 @@ class World:
         if ticket is None:
             return ToolResult("error: no ticket with that id", ok=False)
         self.requester = destination_key(ticket["from"])
+        self.open_ticket = ticket["id"]
         text = (
             f"Ticket {ticket['id']}\nFrom: {ticket['from']}\n"
             f"Customer account: {ticket['customer_id'] or 'none matched'}\n"

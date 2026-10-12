@@ -10,3 +10,5 @@ venv/
 *.db
 sentinel.db
 agent.settings.json
+*.db-shm
+*.db-wal

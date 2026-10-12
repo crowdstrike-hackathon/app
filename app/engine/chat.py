@@ -7,18 +7,25 @@ from datetime import datetime, timezone
 from typing import Any, Optional
 from uuid import uuid4
 
-from ..agent.llm import LLMError, chat_json
-from ..agent.prompt import intent_messages, operator_prompt, result_prompt, retry_prompt, system_prompt
+from ..agent.llm import LLMError, chat_json, partial_answer
+from ..agent.prompt import intent_messages, operator_prompt, reply_nudge, result_prompt, retry_prompt, system_prompt
 from ..config import settings
 from ..riposte import REQUESTER, UNTRUSTED, Decision, Gateway, KeywordFilter, Policy
 from ..riposte.taint import destination_key
 from ..riposte.twin import DEPENDS, SAME, decoy_for, judge, outgoing, swap_messages
+from ..world.seed import SUPPORT_ADDRESS
+from ..world.tickets import deliver
 from ..world.world import TOOLS, World
 
 MODES = ("off", "keyword", "riposte")
 MAX_BLOCKS = 3
 MENTION = re.compile(r"@([A-Za-z0-9][A-Za-z0-9_-]*)")
-SEVERITY = ("compromised", "blocked", "reviewed", "quarantined", "error", "cancelled", "clean")
+SEVERITY = ("compromised", "blocked", "reviewed", "quarantined", "error", "interrupted", "cancelled", "clean")
+RECORDED = ("get_api_key", "issue_refund", "send_email", "reply")
+INTERRUPTED = (
+    "The backend restarted while Nova was handling this. It was not run again, so nothing is sent or refunded "
+    "twice. The actions listed happened before the restart; the audit for this turn did not finish."
+)
 ALIASES = {
     "read_ticket": {"id": "ticket_id", "ticket": "ticket_id"},
     "get_customer": {"id": "customer_id", "customer": "customer_id"},
@@ -65,6 +72,10 @@ def _clean_args(tool: str, raw: Any) -> dict:
 class Chat:
     def __init__(self, user_id: str, mode: str, policy: Optional[Policy] = None, auto_deny: bool = False) -> None:
         self.auto_deny = auto_deny
+        self.preview = False
+        self.hold_timeout = None
+        self.nudge_reply = False
+        self.on_event = None
         self.id = uuid4().hex
         self.user_id = user_id
         self.mode = mode
@@ -82,7 +93,44 @@ class Chat:
         self.task: Optional[asyncio.Task] = None
         self._subscribers: list[asyncio.Queue] = []
         self._holds: dict[str, asyncio.Future] = {}
+        self._deciders: dict[str, str] = {}
         self._step = 0
+
+    @classmethod
+    def restore(cls, saved: dict, user_id: str, mode: str, policy: Optional[Policy] = None) -> "Chat":
+        chat = cls(user_id, mode, policy)
+        chat.id = saved["id"]
+        chat.title = saved.get("title", "")
+        chat.turns = saved.get("turns", [])
+        chat.events = saved.get("events", [])
+        chat.created_at = saved.get("created_at", chat.created_at)
+        chat.updated_at = saved.get("updated_at", chat.updated_at)
+        chat._step = max((e.get("step", 0) for e in chat.events), default=0)
+        return chat
+
+    def fresh_context(self) -> None:
+        self.messages = [{"role": "system", "content": system_prompt()}]
+        self.world.requester = ""
+        self.world.open_ticket = ""
+        if self.gateway:
+            refunded = self.gateway.refunded
+            self.gateway = Gateway(self.policy)
+            self.gateway.refunded = refunded
+
+    def interrupt(self, turn: dict) -> None:
+        index = turn["index"]
+        resolved = {e["hold_id"] for e in self.events if e["type"] == "hold_resolved"}
+        for event in [e for e in self.events if e["type"] == "hold" and e["turn"] == index and e["hold_id"] not in resolved]:
+            self.emit("hold_resolved", turn=index, step=event["step"], hold_id=event["hold_id"], approved=False, by="", expired=True)
+        turn.pop("draft", None)
+        turn["status"], turn["outcome"], turn["summary"] = "interrupted", "interrupted", INTERRUPTED
+        self.status = "idle"
+        self.emit("note", turn=index, level="warn", text="Interrupted by a backend restart. Not run again.")
+        self.emit(
+            "turn_done", turn=index, status="interrupted", outcome="interrupted", summary=INTERRUPTED,
+            incidents=turn.get("incidents", []), stats=turn["stats"], answer=turn.get("answer", ""),
+            acted=turn.get("acted", False), effects=self.world.effects(),
+        )
 
     @property
     def busy(self) -> bool:
@@ -90,7 +138,7 @@ class Chat:
 
     @property
     def outcome(self) -> str:
-        seen = {t["outcome"] for t in self.turns if t.get("acted") or t["outcome"] in ("error", "cancelled")}
+        seen = {t["outcome"] for t in self.turns if t.get("acted") or t["outcome"] in ("error", "cancelled", "interrupted")}
         return next((o for o in SEVERITY if o in seen), "clean")
 
     def emit(self, kind: str, **data: Any) -> dict:
@@ -98,7 +146,24 @@ class Chat:
         self.events.append(event)
         for queue in self._subscribers:
             queue.put_nowait(event)
+        if self.on_event:
+            self.on_event(self, event)
         return event
+
+    def record(self) -> dict:
+        return {
+            "id": self.id, "mode": self.mode, "title": self.title, "turns": self.turns,
+            "created_at": self.created_at, "updated_at": self.updated_at,
+        }
+
+    def _draft(self, turn: dict, text: str) -> None:
+        answer = partial_answer(text)
+        if not answer or answer == turn.get("draft"):
+            return
+        turn["draft"] = answer
+        event = {"seq": len(self.events) - 1, "type": "answer_delta", "turn": turn["index"], "text": answer}
+        for queue in self._subscribers:
+            queue.put_nowait(event)
 
     def subscribe(self, after: int = -1) -> asyncio.Queue:
         queue: asyncio.Queue = asyncio.Queue()
@@ -133,10 +198,11 @@ class Chat:
             data["events"] = self.events
         return data
 
-    def decide(self, hold_id: str, approve: bool) -> bool:
+    def decide(self, hold_id: str, approve: bool, by: str = "") -> bool:
         future = self._holds.get(hold_id)
         if future is None or future.done():
             return False
+        self._deciders[hold_id] = by
         future.set_result(approve)
         return True
 
@@ -175,8 +241,8 @@ class Chat:
             self.title = message[:300]
         turn = {
             "index": index, "message": message, "refs": refs, "intent": "", "status": "running", "outcome": "", "summary": "",
-            "answer": "", "acted": False, "incidents": [],
-            "stats": {"steps": 0, "blocked": 0, "held": 0, "approved": 0, "denied": 0},
+            "answer": "", "acted": False, "incidents": [], "actions": [],
+            "stats": {"steps": 0, "blocked": 0, "held": 0, "confirmed": 0, "approved": 0, "denied": 0, "expired": 0},
         }
         self.turns.append(turn)
         self.status = "running"
@@ -186,7 +252,7 @@ class Chat:
 
     async def run_turn(self, turn: dict) -> None:
         marks = self.world.marks()
-        state = {"scope": None, "quarantined": False}
+        state = {"scope": None, "quarantined": False, "replied": False, "nudged": False}
         try:
             await self._loop(turn, state)
             turn["status"] = "done"
@@ -202,6 +268,7 @@ class Chat:
         self._finish(turn, state, marks)
 
     def _finish(self, turn: dict, state: dict, marks: tuple[int, int, int]) -> None:
+        turn.pop("draft", None)
         stats = turn["stats"]
         incidents = self.world.audit(state["scope"], marks)
         turn["incidents"] = incidents
@@ -217,7 +284,17 @@ class Chat:
             calls = "1 tool call" if stats["blocked"] == 1 else f"{stats['blocked']} tool calls"
             outcome, summary = "blocked", f"Riposte blocked {calls}. Nothing confidential left the sandbox."
         elif stats["held"]:
-            outcome, summary = "reviewed", "Riposte held an action until a person decided. Nothing confidential left the sandbox."
+            verdicts = [
+                f"{stats[name]} {label}" for name, label in
+                (("approved", "approved by a person"), ("denied", "denied by a person"), ("expired", "denied when the review timed out"))
+                if stats[name]
+            ]
+            held = "1 action" if stats["held"] == 1 else f"{stats['held']} actions"
+            outcome = "reviewed"
+            summary = f"Riposte held {held} for review: {', '.join(verdicts)}. The audit found nothing confidential leaving the sandbox."
+        elif stats["confirmed"]:
+            sent = "the message" if stats["confirmed"] == 1 else f"{stats['confirmed']} messages"
+            outcome, summary = "clean", f"Every tool call was within policy. You reviewed {sent} before anything went out."
         else:
             outcome, summary = "clean", "Every tool call was within policy."
         turn["outcome"], turn["summary"] = outcome, summary
@@ -239,7 +316,10 @@ class Chat:
         for _ in range(3):
             if problem:
                 self.messages.append({"role": "user", "content": retry_prompt(problem)})
-            action = await chat_json(self.messages)
+            if self._subscribers and not self.preview:
+                action = await chat_json(self.messages, on_text=lambda text: self._draft(turn, text))
+            else:
+                action = await chat_json(self.messages)
             name = str(action.get("tool") or action.get("action") or "").strip()
             if name not in TOOLS:
                 problem = f"'{name}' is not one of the tools" if name else "the tool name is missing"
@@ -344,15 +424,28 @@ class Chat:
         hold_id = uuid4().hex[:10]
         future: asyncio.Future = asyncio.get_running_loop().create_future()
         self._holds[hold_id] = future
-        turn["stats"]["held"] += 1
+        turn["stats"]["confirmed" if decision.rule == "outgoing" else "held"] += 1
         self.status = "waiting"
         self.emit("hold", turn=turn["index"], step=step, hold_id=hold_id, tool=name, args=args, decision=decision.to_dict())
         if self.auto_deny:
             future.set_result(False)
-        approved = await future
+        elif self.preview:
+            future.set_result(True)
+        expired = False
+        try:
+            approved = await asyncio.wait_for(asyncio.shield(future), self.hold_timeout)
+        except asyncio.TimeoutError:
+            if not future.done():
+                future.set_result(False)
+            approved = False
+            expired = True
+            self.emit("note", turn=turn["index"], level="warn", text="Nobody reviewed this in time, so the action was denied.")
         self.status = "running"
-        turn["stats"]["approved" if approved else "denied"] += 1
-        self.emit("hold_resolved", turn=turn["index"], step=step, hold_id=hold_id, approved=approved)
+        turn["stats"]["approved" if approved else "expired" if expired else "denied"] += 1
+        self.emit(
+            "hold_resolved", turn=turn["index"], step=step, hold_id=hold_id, approved=approved,
+            by=self._deciders.pop(hold_id, ""), expired=expired,
+        )
         return approved
 
     async def _intent(self) -> str:
@@ -386,6 +479,10 @@ class Chat:
 
             if name == "answer":
                 message = str(args.get("message", "")).strip()
+                if message and self.nudge_reply and self.world.requester and not state["replied"] and not state["nudged"]:
+                    state["nudged"] = True
+                    self.messages.append({"role": "user", "content": reply_nudge()})
+                    continue
                 if message:
                     turn["answer"] = message
                     return
@@ -393,6 +490,8 @@ class Chat:
                 continue
 
             turn["acted"] = True
+            if name == "reply":
+                state["replied"] = True
             decision = self._check(name, args)
             if decision.action != "block":
                 decision = await self._twin(turn, name, args) or decision
@@ -424,6 +523,20 @@ class Chat:
 
             result = self.world.execute(name, args, approved=approved)
             self._observe(name, result, args, approved)
+            if result.ok and name in RECORDED:
+                done = {"tool": name, "step": step, "approved": approved}
+                if name in ("reply", "send_email"):
+                    body = str(args.get("message") or args.get("body") or "")
+                    done["to"] = self.world.requester if name == "reply" else destination_key(str(args.get("to", "")))
+                    done["has_key"] = any(c["api_key"] in body for c in self.world.customers.values())
+                    done["delivered"] = bool(self.world.open_ticket) and not self.preview and deliver(self.world.open_ticket, {
+                        "from": SUPPORT_ADDRESS, "to": done["to"], "subject": str(args.get("subject", "")), "body": body,
+                    }, key=f"{self.id}:{step}")
+                else:
+                    done["customer_id"] = str(args.get("customer_id", "")).strip().upper()
+                    if name == "issue_refund":
+                        done["amount"] = self.world.refunds[-1]["amount"]
+                turn["actions"].append(done)
             label = TOOLS[name].returns if result.ok else ""
             self.emit("result", turn=index, step=step, tool=name, ok=result.ok, text=result.text, label=label, approved=approved)
             text = result.text
@@ -450,6 +563,10 @@ class ChatStore:
 
     def create(self, user_id: str, mode: str) -> Chat:
         chat = Chat(user_id, mode)
+        self.chats[chat.id] = chat
+        return chat
+
+    def adopt(self, chat: Chat) -> Chat:
         self.chats[chat.id] = chat
         return chat
 

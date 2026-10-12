@@ -68,9 +68,9 @@ Tickets are loaded from `tickets.json` in this directory on every request, so ed
 a restart. If that file does not exist, `tickets.sample.json` is used.
 
 Runtime tickets can also be added with authenticated `POST /api/tickets`, using
-`{"from":"dana@acmerobotics.com","subject":"...","body":"..."}`. The desk generates
-an ID and matches the sender to one of the three sandbox accounts. Runtime tickets
-are private to the signed-in user and remain available until the backend restarts.
+`{"from":"dana@acmerobotics.com","subject":"...","body":"..."}`. The backend generates
+an ID and matches the sender to a sandbox account when the address is one on file.
+These are private to the signed-in user and remain available until the backend restarts.
 
 ```json
 {
@@ -94,7 +94,8 @@ or `attack` and only labels the ticket in the UI. `title` is the short name show
 
 ## API
 
-All routes except `/api/meta` and `/api/auth/*` need a bearer token.
+Console routes need a bearer token, except `/api/meta` and `/api/auth/*`.
+The public `/inbound/*` mail door does not require login.
 
 | Route | Purpose |
 | --- | --- |
@@ -102,10 +103,8 @@ All routes except `/api/meta` and `/api/auth/*` need a bearer token.
 | `GET /api/meta` | Model status, modes, policy, tools |
 | `GET /api/tickets` | Tickets from `tickets.json` |
 | `POST /api/tickets` | Add a runtime sandbox ticket |
-| `GET /api/settings/redteam`, `PUT /api/settings/redteam` | Inspect or configure the attacker endpoint |
-| `POST /api/redteam` | Start rounds: `{"rounds":6,"goal":"cycle"}` |
-| `GET /api/redteam/{id}` | Running rounds, traces, audit evidence, and tally |
-| `POST /api/redteam/{id}/cancel` | Stop a tournament |
+| `POST /inbound` | Public: email Northwind support with `{from, subject, body}`; returns the ticket ID and an unguessable `receipt` |
+| `GET /inbound/replies?from=address` | Public: mail Nova sent to that address, for the `receipt` passed in the `X-Ticket-ID` header |
 | `GET /api/world` | Customers, help-center articles, policy |
 | `POST /api/chats` | Start a conversation with its first message. Body: `{"mode": "riposte", "message": "Handle @TK-2001"}` |
 | `POST /api/chats/{id}/messages` | Send the next message. Body: `{"message": "..."}` |
@@ -115,21 +114,17 @@ All routes except `/api/meta` and `/api/auth/*` need a bearer token.
 | `POST /api/chats/{id}/cancel` | Stop the turn in progress |
 | `GET /api/history` | Past conversations |
 
-## Attacker arena
+## Inbound mail
 
-Open `/redteam` in the frontend, or follow **Attacker arena** from the console.
-The attacker's one-block system prompt is `app/agent/attacker_prompt.txt`.
-Goals are `external_key`, `cross_customer_key`, `refund_over_limit`, or `cycle`.
-Each round creates a runtime ticket, runs fresh Nova chats in `off` and `riposte`
-with identical fake customer data, audits their effects, and feeds both replies
-and audit results back to the attacker before requesting another ticket. Riposte
-holds are automatically denied. Model errors are displayed separately from scored
-runs. Tournaments and runtime inbox additions are held in memory for this demo.
-Attacker settings changed in the UI last until restart; `.env` sets startup values.
+`POST /inbound` is Northwind's public support address. Anyone can send to it without signing in. The
+email lands in the same inbox the console shows, marked new, with an ID such as `TK-3001`. The sender is
+matched to an account only when the address is exactly one on file. Nothing handles it automatically:
+an operator reviews it in the console's Mail view, sees what Nova would do with it, and hands it to Nova.
 
-Verification:
+The response also carries a `receipt`. The sender can read only what Nova sent to their own address for
+that ticket, by passing the receipt in `X-Ticket-ID` to `GET /inbound/replies?from=address`.
 
-```bash
-.venv/bin/python -m unittest discover -s tests -v
-.venv/bin/python -m scripts.check_redteam  # two live rounds using configured models
-```
+Inbound tickets and delivered mail are saved to `MAIL_STATE_PATH` (`mailbox.db`) and survive restarts.
+Submissions are capped at 24,000 request bytes, a 300-character subject and a 16,000-character body,
+with a per-sender limit of 12 a minute.
+

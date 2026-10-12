@@ -8,6 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from .agent import runtime
 from .api.auth_routes import router as auth_router
 from .api.routes import router as api_router
+from .api.inbound import open_mailbox, router as inbound_router
 from .config import settings
 from .db import init_db
 
@@ -16,6 +17,7 @@ from .db import init_db
 async def lifespan(app: FastAPI):
     runtime.load()
     await init_db()
+    open_mailbox()
     yield
 
 
@@ -36,6 +38,7 @@ app.add_middleware(
 
 app.include_router(auth_router)
 app.include_router(api_router)
+app.include_router(inbound_router)
 
 
 @app.get("/health")

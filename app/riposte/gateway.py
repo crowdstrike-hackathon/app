@@ -34,6 +34,7 @@ class Policy:
     refund_limit: float = 200.0
     enforce_scope: bool = True
     hold_unverified: bool = True
+    confirm_outgoing: bool = True
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -172,6 +173,16 @@ class Gateway:
             evidence,
         )
 
+    def _confirm(self, name: str, evidence: list[Evidence]) -> Decision:
+        if not self.policy.confirm_outgoing:
+            return Decision(evidence=evidence)
+        return Decision(
+            "hold", "outgoing", "A message to a customer is ready to send",
+            f"{name} would send this to someone outside {', '.join(self.policy.internal_domains)}. "
+            f"Approve it to send it, or deny it to stop it.",
+            evidence,
+        )
+
     def check(self, tool: Tool, args: dict) -> Decision:
         evidence = self.annotate(tool, args)
 
@@ -271,7 +282,9 @@ class Gateway:
                     evidence,
                 )
 
-        return Decision(evidence=evidence)
+        if self._is_internal(dest):
+            return Decision(evidence=evidence)
+        return self._confirm(tool.name, evidence)
 
     def check_reply(self, text: str) -> Decision:
         if not self.authorized:
@@ -288,4 +301,4 @@ class Gateway:
         leak = self._record_leak(text, dest, "reply", [Evidence("message", text[:240], UNKNOWN, [])])
         if leak:
             return leak
-        return Decision()
+        return self._confirm("reply", [Evidence("message", text[:240], UNKNOWN, [])])

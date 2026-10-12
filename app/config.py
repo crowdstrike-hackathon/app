@@ -16,18 +16,14 @@ class Settings(BaseSettings):
     agent_api_key: str = "ollama"
     agent_max_steps: int = 10
 
-    redteam_base_url: str = "http://localhost:11435/v1"
-    redteam_model: str = "redteam-clean:latest"
-    redteam_api_key: str = "ollama"
-    redteam_rounds: int = 6
-    redteam_disable_thinking: bool = True
-    redteam_transport: str = "ollama_raw"
     agent_timeout_seconds: float = 90.0
+    inbound_per_sender_per_minute: int = 12
 
     tickets_path: str = "tickets.json"
     tickets_fallback_path: str = "tickets.sample.json"
 
     database_url: str = "sqlite+aiosqlite:///./riposte.db"
+    mail_state_path: str = "mailbox.db"
 
     jwt_secret: str = "dev-only-change-me-32byte-minimum-secret-key-0001"
     jwt_algorithm: str = "HS256"

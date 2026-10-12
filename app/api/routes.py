@@ -12,12 +12,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sse_starlette.sse import EventSourceResponse
 
 from ..agent import runtime
-from ..agent.llm import model_status
+from ..agent.llm import LLMError, model_status
 from ..auth import decode_token, get_current_user
 from ..db import SessionLocal, get_db
 from ..engine.chat import Chat, store
-from ..engine.redteam import GOALS, Tournament, tournaments
-from ..config import settings
+from ..engine.preview import preview
 from ..orm import RunRecord, User
 from ..riposte import Policy
 from ..riposte.baseline import _PATTERNS
@@ -64,59 +63,6 @@ class TicketBody(BaseModel):
     body: str = Field(min_length=1, max_length=16000)
 
 
-class RedteamBody(BaseModel):
-    rounds: int = Field(default=6, ge=1, le=50)
-    goal: Literal["cycle", "external_key", "cross_customer_key", "refund_over_limit"] = "cycle"
-
-
-@router.get("/settings/redteam")
-async def redteam_settings(user: User = Depends(get_current_user)):
-    return {"base_url": settings.redteam_base_url, "model": settings.redteam_model,
-            "rounds": settings.redteam_rounds, "goals": list(GOALS),
-            "status": await model_status(settings.redteam_base_url, settings.redteam_model, settings.redteam_api_key)}
-
-
-@router.put("/settings/redteam")
-async def save_redteam_settings(body: AgentBody, user: User = Depends(get_current_user)):
-    if any(t.status == "running" for t in tournaments.values()):
-        raise HTTPException(409, "Wait for the active tournament before changing its model")
-    base, model, key = _agent_values(body)
-    settings.redteam_base_url, settings.redteam_model = base, model
-    if key:
-        settings.redteam_api_key = key
-    return await redteam_settings(user)
-
-
-@router.post("/redteam")
-async def start_redteam(body: RedteamBody, user: User = Depends(get_current_user)):
-    if any(t.user_id == user.id and t.status == "running" for t in tournaments.values()):
-        raise HTTPException(409, "A tournament is already running")
-    tournament = Tournament(user.id, body.rounds, body.goal)
-    tournaments[tournament.id] = tournament
-    tournament.task = asyncio.create_task(tournament.run())
-    return tournament.snapshot()
-
-
-def _tournament(run_id: str, user: User):
-    tournament = tournaments.get(run_id)
-    if tournament is None or tournament.user_id != user.id:
-        raise HTTPException(404, "Tournament not found")
-    return tournament
-
-
-@router.get("/redteam/{run_id}")
-def get_redteam(run_id: str, user: User = Depends(get_current_user)):
-    return _tournament(run_id, user).snapshot()
-
-
-@router.post("/redteam/{run_id}/cancel")
-def cancel_redteam(run_id: str, user: User = Depends(get_current_user)):
-    tournament = _tournament(run_id, user)
-    if tournament.task and tournament.status == "running":
-        tournament.task.cancel()
-    return {"ok": True}
-
-
 def _agent_values(body: AgentBody) -> tuple[str, str, str]:
     base_url = body.base_url.strip().rstrip("/")
     if not base_url.startswith(("http://", "https://")):
@@ -140,7 +86,7 @@ async def test_agent_settings(body: AgentBody, user: User = Depends(get_current_
 
 @router.put("/settings/agent")
 async def save_agent_settings(body: AgentBody, user: User = Depends(get_current_user)) -> dict:
-    if any(chat.busy for chat in store.chats.values()) or any(t.status == "running" for t in tournaments.values()):
+    if any(chat.busy for chat in store.chats.values()):
         raise HTTPException(409, "Nova is in the middle of a conversation. Try again when it finishes.")
     runtime.save(*_agent_values(body))
     return {**runtime.describe(), "status": await model_status()}
@@ -165,6 +111,17 @@ async def meta() -> dict:
 def tickets(user: User = Depends(get_current_user)) -> dict:
     items, info = load_tickets(user.id)
     return {"tickets": items, "file": info}
+
+
+@router.post("/tickets/{ticket_id}/preview")
+async def preview_ticket(ticket_id: str, fresh: bool = Query(False), user: User = Depends(get_current_user)) -> dict:
+    items, _ = load_tickets(user.id)
+    if not any(t["id"].upper() == ticket_id.upper() for t in items):
+        raise HTTPException(404, "No ticket with that id")
+    try:
+        return await preview(user.id, ticket_id.upper(), fresh)
+    except LLMError as exc:
+        raise HTTPException(502, str(exc)) from exc
 
 
 @router.post("/tickets")
@@ -297,15 +254,15 @@ async def delete_chat(chat_id: str, user: User = Depends(get_current_user), db: 
 
 
 @router.post("/chats/{chat_id}/holds/{hold_id}")
-def decide_hold(chat_id: str, hold_id: str, body: HoldBody, user: User = Depends(get_current_user)) -> dict:
+async def decide_hold(chat_id: str, hold_id: str, body: HoldBody, user: User = Depends(get_current_user)) -> dict:
     chat = _chat(chat_id, user.id)
-    if not chat.decide(hold_id, body.decision == "approve"):
+    if not chat.decide(hold_id, body.decision == "approve", by=user.email):
         raise HTTPException(409, "That hold is not waiting for a decision")
     return {"ok": True, "hold_id": hold_id, "decision": body.decision}
 
 
 @router.post("/chats/{chat_id}/cancel")
-def cancel_chat(chat_id: str, user: User = Depends(get_current_user)) -> dict:
+async def cancel_chat(chat_id: str, user: User = Depends(get_current_user)) -> dict:
     _chat(chat_id, user.id).cancel()
     return {"ok": True}
 

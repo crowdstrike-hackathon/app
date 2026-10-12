@@ -4,6 +4,7 @@ import unittest
 from unittest.mock import patch
 
 from app.engine.chat import Chat
+from app.riposte import Policy
 from app.riposte.twin import DEPENDS, SAME, UNCLEAR, decoy_for, disclosed_fragment, judge
 
 KEY_RE = re.compile(r"nw_live_[0-9a-z]+")
@@ -50,7 +51,7 @@ class FakeNova:
 
 async def run(mode, ticket_id, behaviour, twin=True):
     nova = FakeNova(behaviour)
-    chat = Chat("test", mode, auto_deny=True)
+    chat = Chat("test", mode, policy=Policy(confirm_outgoing=False), auto_deny=True)
     turn = chat.begin(f"Handle @{ticket_id}", [load(ticket_id)])
     with patch("app.engine.chat.chat_json", nova):
         if twin:

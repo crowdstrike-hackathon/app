@@ -1,10 +1,16 @@
 from __future__ import annotations
 
 import json
+import re
 
 import httpx
 
 from ..config import settings
+
+
+_ANSWER_TOOL = re.compile(r'"(?:tool|action)"\s*:\s*"answer"')
+_ANSWER_FIELD = re.compile(r'"(?:message|text|body|content)"\s*:\s*"')
+_ESCAPES = {"n": "\n", "t": "\t", "r": "\r", "b": "\b", "f": "\f"}
 
 
 class LLMError(RuntimeError):
@@ -46,9 +52,65 @@ def extract_json(text: str) -> dict:
     raise LLMError("unbalanced JSON in model reply")
 
 
+async def _stream(client: httpx.AsyncClient, url: str, headers: dict, payload: dict, on_text) -> str:
+    text = ""
+    async with client.stream("POST", url, headers=headers, json={**payload, "stream": True}) as resp:
+        if resp.status_code >= 400:
+            await resp.aread()
+            resp.raise_for_status()
+        async for line in resp.aiter_lines():
+            if not line.startswith("data:"):
+                continue
+            data = line[5:].strip()
+            if data == "[DONE]":
+                break
+            choices = json.loads(data).get("choices") or []
+            piece = (choices[0].get("delta") or {}).get("content") if choices else None
+            if piece:
+                text += piece
+                on_text(text)
+    return text
+
+
+def partial_answer(text: str) -> str:
+    """Return the answer message written so far in a half-streamed action, or "" if it is not an answer."""
+    tool = _ANSWER_TOOL.search(text)
+    if not tool:
+        return ""
+    field = _ANSWER_FIELD.search(text, tool.end())
+    if not field:
+        return ""
+    out = []
+    i = field.end()
+    while i < len(text):
+        ch = text[i]
+        if ch == '"':
+            break
+        if ch != "\\":
+            out.append(ch)
+            i += 1
+            continue
+        if i + 1 >= len(text):
+            break
+        esc = text[i + 1]
+        if esc == "u":
+            code = text[i + 2 : i + 6]
+            if len(code) < 4:
+                break
+            try:
+                out.append(chr(int(code, 16)))
+            except ValueError:
+                pass
+            i += 6
+            continue
+        out.append(_ESCAPES.get(esc, esc))
+        i += 2
+    return "".join(out).encode("utf-16", "surrogatepass").decode("utf-16", "ignore")
+
+
 async def chat_json(
     messages: list[dict], *, temperature: float = 0.0, base_url: str = "", model: str = "", api_key: str = "",
-    extra: dict | None = None, strict: bool = False,
+    extra: dict | None = None, strict: bool = False, on_text=None,
 ) -> dict:
     base = (base_url or settings.agent_base_url).rstrip("/")
     payload = {
@@ -58,15 +120,15 @@ async def chat_json(
         "response_format": {"type": "json_object"},
         **(extra or {"seed": 7}),
     }
+    headers = {"Authorization": f"Bearer {api_key or settings.agent_api_key}"}
     try:
         async with httpx.AsyncClient(timeout=settings.agent_timeout_seconds) as client:
-            resp = await client.post(
-                f"{base}/chat/completions",
-                headers={"Authorization": f"Bearer {api_key or settings.agent_api_key}"},
-                json=payload,
-            )
-            resp.raise_for_status()
-            text = resp.json()["choices"][0]["message"]["content"]
+            if on_text:
+                text = await _stream(client, f"{base}/chat/completions", headers, payload, on_text)
+            else:
+                resp = await client.post(f"{base}/chat/completions", headers=headers, json=payload)
+                resp.raise_for_status()
+                text = resp.json()["choices"][0]["message"]["content"]
     except httpx.HTTPStatusError as exc:
         raise LLMError(f"model endpoint returned {exc.response.status_code}: {exc.response.text[:200]}") from exc
     except httpx.HTTPError as exc:
