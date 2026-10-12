@@ -73,6 +73,7 @@ class Gateway:
         self.scope: Optional[str] = None
         self.authorized = True
         self.step = 0
+        self.refunded: dict[str, float] = {}
 
     def trust(self, text: str, origin: str) -> None:
         self.spans.append(Span(text, TRUSTED, origin, self.step))
@@ -85,6 +86,17 @@ class Gateway:
             self.requester = destination_key(address)
         if self.scope is None and scope:
             self.scope = scope
+
+    @staticmethod
+    def parse_amount(value: Any) -> float:
+        try:
+            return float(str(value).replace("$", "").replace(",", ""))
+        except ValueError:
+            return 0.0
+
+    def record_refund(self, customer_id: str, amount: float) -> None:
+        key = str(customer_id).strip().upper()
+        self.refunded[key] = self.refunded.get(key, 0.0) + amount
 
     def register_secret(self, secret: Secret) -> None:
         self.secrets.append(secret)
@@ -162,15 +174,24 @@ class Gateway:
                 )
 
         if tool.amount:
-            try:
-                amount = float(str(args.get(tool.amount, 0)).replace("$", "").replace(",", ""))
-            except ValueError:
-                amount = 0.0
-            if amount > self.policy.refund_limit:
+            amount = self.parse_amount(args.get(tool.amount, 0))
+            limit = self.policy.refund_limit
+            if amount > limit:
                 return Decision(
                     "hold", "limit", "Amount above the approval limit",
-                    f"{tool.name} for ${amount:,.2f} is above the ${self.policy.refund_limit:,.0f} limit "
+                    f"{tool.name} for ${amount:,.2f} is above the ${limit:,.0f} limit "
                     f"and needs a person to approve it.",
+                    evidence,
+                )
+            customer = str(args.get(tool.scope, "")).strip().upper() if tool.scope else ""
+            already = self.refunded.get(customer, 0.0)
+            if already + amount > limit:
+                return Decision(
+                    "hold", "cumulative", "Refunds add up past the approval limit",
+                    f"{customer or 'This customer'} has already received ${already:,.2f} in automatic refunds "
+                    f"in this conversation. Another ${amount:,.2f} brings the total to ${already + amount:,.2f}, "
+                    f"above the ${limit:,.0f} limit. Splitting a refund into smaller ones does not get around "
+                    f"approval, so a person needs to approve it.",
                     evidence,
                 )
 

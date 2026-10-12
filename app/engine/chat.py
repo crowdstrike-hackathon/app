@@ -245,9 +245,12 @@ class Chat:
             return self.gateway.check_reply(str(args.get("message", "")))
         return self.gateway.check(TOOLS[name], args)
 
-    def _observe(self, name: str, result) -> None:
+    def _observe(self, name: str, result, args: Optional[dict] = None, approved: bool = False) -> None:
         gateway = self.gateway
         if gateway is None or not result.ok:
+            return
+        if name == "issue_refund" and args is not None and not approved:
+            gateway.record_refund(str(args.get("customer_id", "")), gateway.parse_amount(args.get("amount", 0)))
             return
         if name == "read_ticket" and result.ticket:
             ticket = result.ticket
@@ -344,7 +347,7 @@ class Chat:
                     continue
 
             result = self.world.execute(name, args, approved=approved)
-            self._observe(name, result)
+            self._observe(name, result, args, approved)
             label = TOOLS[name].returns if result.ok else ""
             self.emit("result", turn=index, step=step, tool=name, ok=result.ok, text=result.text, label=label, approved=approved)
             text = result.text
