@@ -12,6 +12,7 @@ from ..agent.prompt import intent_messages, operator_prompt, result_prompt, retr
 from ..config import settings
 from ..riposte import REQUESTER, UNTRUSTED, Decision, Gateway, KeywordFilter, Policy
 from ..riposte.taint import destination_key
+from ..riposte.twin import DEPENDS, SAME, decoy_for, judge, outgoing, swap_messages
 from ..world.world import TOOLS, World
 
 MODES = ("off", "keyword", "riposte")
@@ -31,6 +32,18 @@ ALIASES = {
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _quote(text: str, limit: int = 160) -> str:
+    """Quote an outgoing message for display, ending the sentence after the closing quote."""
+    text = " ".join(text.split())
+    for label in ("reply: ",):
+        if text.startswith(label):
+            text = text[len(label):]
+    if len(text) > limit:
+        text = text[: limit - 1] + "\u2026"
+    end = "" if text[-1:] in ".!?\u2026" else "."
+    return f"\u201c{text}\u201d{end}"
 
 
 def _clean_args(tool: str, raw: Any) -> dict:
@@ -246,6 +259,63 @@ class Chat:
             return self.gateway.check_reply(str(args.get("message", "")))
         return self.gateway.check(TOOLS[name], args)
 
+    async def _twin(self, turn: dict, name: str, args: dict) -> Optional[Decision]:
+        """Re-run the agent's last step with decoy keys and block messages that depend on a real key."""
+        gateway = self.gateway
+        if gateway is None or name not in ("reply", "send_email"):
+            return None
+        dest = (gateway.requester or "") if name == "reply" else destination_key(str(args.get("to", "")))
+        at_risk = gateway.secrets_at_risk(dest)
+        if not at_risk:
+            return None
+        decoys = {s.value: decoy_for(s.value) for s in at_risk}
+        history = self.messages[:-1]
+        original = outgoing(name, args)
+        index = turn["index"]
+        self.emit("note", turn=index, level="info", text=(
+            "Twin run: the agent has read a key this recipient may not see, so the same step is being "
+            "asked again with a decoy key in its place."
+        ))
+        try:
+            verdict = judge(original, self._as_outgoing(await chat_json(swap_messages(history, decoys))), None, decoys)
+            if verdict.result != SAME:
+                control = self._as_outgoing(await chat_json(history))
+                verdict = judge(original, verdict.twin, control, decoys)
+        except LLMError as exc:
+            return Decision(
+                "hold", "twin", "Twin run could not finish",
+                f"The decoy re-run failed ({exc}), so it is unknown whether this message reveals a key. "
+                f"A person needs to approve it.",
+            )
+        names = ", ".join(f"{s.owner_name}'s {s.name}" for s in at_risk)
+        who = dest or "the ticket sender"
+        if verdict.result == SAME:
+            self.emit("note", turn=index, level="info", text=(
+                "Twin run: the decoy key produced the same message, so it does not reveal anything about the real key."
+            ))
+            return None
+        shown_real, shown_twin = _quote(verdict.original), _quote(verdict.twin)
+        if verdict.result == DEPENDS:
+            return Decision(
+                "block", "twin", "This message depends on a secret it does not contain",
+                f"With the real key, the agent would send {shown_real} With a decoy key in its place, it would "
+                f"send {shown_twin} Asking again with the real key gave the original answer, so the difference "
+                f"comes from the key: the message carries information about {names} to {who}, who may not have it.",
+            )
+        return Decision(
+            "hold", "twin", "This message may depend on a secret",
+            f"With a decoy key in place of {names} the agent would send something different "
+            f"({shown_twin[:-1] if shown_twin.endswith('.') else shown_twin}), but its answer also varies without the decoy, so the cause is unclear. "
+            f"A person needs to approve sending this to {who}.",
+        )
+
+    @staticmethod
+    def _as_outgoing(action: dict) -> str:
+        name = str(action.get("tool") or action.get("action") or "").strip()
+        if name not in TOOLS:
+            return f"invalid: {json.dumps(action, sort_keys=True)}"
+        return outgoing(name, _clean_args(name, action.get("args") or action.get("arguments") or {}))
+
     def _observe(self, name: str, result, args: Optional[dict] = None, approved: bool = False) -> None:
         gateway = self.gateway
         if gateway is None or not result.ok:
@@ -324,6 +394,8 @@ class Chat:
 
             turn["acted"] = True
             decision = self._check(name, args)
+            if decision.action != "block":
+                decision = await self._twin(turn, name, args) or decision
             self.emit(
                 "call", turn=index, step=step, tool=name, args=args, thought=action["thought"],
                 decision=decision.to_dict(), checked=self.gateway is not None,
