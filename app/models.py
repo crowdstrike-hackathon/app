@@ -103,3 +103,44 @@ class SessionState(BaseModel):
     investigations: list[Investigation] = Field(default_factory=list)
     actions: list[ResponseAction] = Field(default_factory=list)
     score: Score = Field(default_factory=Score)
+
+
+class GuardDecision(BaseModel):
+    id: str = Field(default_factory=_uuid)
+    ts: str = Field(default_factory=_now)
+    step_index: int = 0
+    layer: str = ""
+    allow: bool = True
+    severity: str = "info"
+    attack_id: Optional[str] = None
+    attack_name: Optional[str] = None
+    reason: str = ""
+
+
+class AgentStep(BaseModel):
+    index: int
+    ts: str = Field(default_factory=_now)
+    thought: str = ""
+    tool: Optional[str] = None
+    args: dict[str, Any] = Field(default_factory=dict)
+    privileged: bool = False
+    egress: bool = False
+    observation: str = ""
+    blocked: bool = False
+    guard_reason: str = ""
+    final: Optional[str] = None
+
+
+class AgentRunState(BaseModel):
+    id: str
+    ticket_id: str = ""
+    subject: str = ""
+    defense: bool = True
+    mode: str = "mock"
+    status: str = "ready"
+    outcome: str = ""
+    steps: list[AgentStep] = Field(default_factory=list)
+    decisions: list[GuardDecision] = Field(default_factory=list)
+    actions: list[ResponseAction] = Field(default_factory=list)
+    final_answer: str = ""
+    exfil: list[dict[str, Any]] = Field(default_factory=list)

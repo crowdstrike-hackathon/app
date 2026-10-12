@@ -106,3 +106,40 @@ class ActionRow(Base):
     status: Mapped[str] = mapped_column(String(16), default="proposed")
 
     run: Mapped[Run] = relationship(back_populates="actions")
+
+
+class AgentRun(Base):
+    __tablename__ = "agent_runs"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    ticket_id: Mapped[str] = mapped_column(String(32), default="")
+    subject: Mapped[str] = mapped_column(String(200), default="")
+    defense: Mapped[bool] = mapped_column(Boolean, default=True)
+    mode: Mapped[str] = mapped_column(String(16), default="mock")
+    status: Mapped[str] = mapped_column(String(16), default="ready")
+    outcome: Mapped[str] = mapped_column(String(24), default="")
+    step_count: Mapped[int] = mapped_column(Integer, default=0)
+    blocked_count: Mapped[int] = mapped_column(Integer, default=0)
+    final_answer: Mapped[str] = mapped_column(Text, default="")
+    trace: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class Connection(Base):
+    __tablename__ = "connections"
+
+    user_id: Mapped[str] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), primary_key=True
+    )
+    sim_mode: Mapped[str] = mapped_column(String(16), default="mock")
+    blue_kind: Mapped[str] = mapped_column(String(24), default="anthropic")
+    blue_base_url: Mapped[str] = mapped_column(String(255), default="")
+    blue_api_key: Mapped[str] = mapped_column(String(255), default="")
+    blue_model: Mapped[str] = mapped_column(String(120), default="")
+    red_kind: Mapped[str] = mapped_column(String(24), default="openai")
+    red_base_url: Mapped[str] = mapped_column(String(255), default="")
+    red_api_key: Mapped[str] = mapped_column(String(255), default="")
+    red_model: Mapped[str] = mapped_column(String(120), default="")
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, onupdate=_now)

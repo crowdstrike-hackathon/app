@@ -42,13 +42,14 @@ def _extract_json(text: str) -> dict:
 class ClaudeProvider(LLMProvider):
     name = "claude"
 
-    def __init__(self) -> None:
+    def __init__(self, api_key: Optional[str] = None, model: Optional[str] = None) -> None:
         from anthropic import AsyncAnthropic
 
-        if not settings.blue_ready:
+        key = api_key or settings.anthropic_api_key
+        if not key or key.endswith("REPLACE_ME"):
             raise LLMError("ANTHROPIC_API_KEY is not set")
-        self._client = AsyncAnthropic(api_key=settings.anthropic_api_key)
-        self._model = settings.blue_model_name
+        self._client = AsyncAnthropic(api_key=key)
+        self._model = model or settings.blue_model_name
 
     async def complete_json(self, system: str, user: str, *, temperature: float = 0.4) -> dict:
         msg = await self._client.messages.create(
@@ -65,12 +66,13 @@ class ClaudeProvider(LLMProvider):
 class LocalOpenAIProvider(LLMProvider):
     name = "local-openai"
 
-    def __init__(self) -> None:
-        if not settings.red_ready:
+    def __init__(self, base_url: Optional[str] = None, api_key: Optional[str] = None, model: Optional[str] = None) -> None:
+        key = api_key if api_key is not None else settings.red_model_api_key
+        if not key or key.endswith("REPLACE_ME"):
             raise LLMError("RED_MODEL_API_KEY is not set")
-        self._base = settings.red_model_base_url.rstrip("/")
-        self._key = settings.red_model_api_key
-        self._model = settings.red_model_name
+        self._base = (base_url or settings.red_model_base_url).rstrip("/")
+        self._key = key
+        self._model = model or settings.red_model_name
 
     async def complete_json(self, system: str, user: str, *, temperature: float = 0.8) -> dict:
         async with httpx.AsyncClient(timeout=60.0) as client:
