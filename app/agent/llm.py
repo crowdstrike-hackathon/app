@@ -108,18 +108,22 @@ def partial_answer(text: str) -> str:
     return "".join(out).encode("utf-16", "surrogatepass").decode("utf-16", "ignore")
 
 
+def _reasoning(model: str) -> bool:
+    name = model.lower()
+    return name.startswith(("gpt-5", "o1", "o3", "o4")) and "chat" not in name
+
+
 async def chat_json(
     messages: list[dict], *, temperature: float = 0.0, base_url: str = "", model: str = "", api_key: str = "",
     extra: dict | None = None, strict: bool = False, on_text=None,
 ) -> dict:
     base = (base_url or settings.agent_base_url).rstrip("/")
-    payload = {
-        "model": model or settings.agent_model,
-        "messages": messages,
-        "temperature": temperature,
-        "response_format": {"type": "json_object"},
-        **(extra or {"seed": 7}),
-    }
+    name = model or settings.agent_model
+    payload = {"model": name, "messages": messages, "response_format": {"type": "json_object"}}
+    if extra is None and _reasoning(name):
+        payload["reasoning_effort"] = settings.agent_reasoning_effort
+    else:
+        payload.update({"temperature": temperature, **(extra or {"seed": 7})})
     headers = {"Authorization": f"Bearer {api_key or settings.agent_api_key}"}
     try:
         async with httpx.AsyncClient(timeout=settings.agent_timeout_seconds) as client:

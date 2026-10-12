@@ -59,8 +59,10 @@ hosted model instead, set these in `.env` (which is not committed):
 ```
 AGENT_BASE_URL=https://api.openai.com/v1
 AGENT_API_KEY=sk-...
-AGENT_MODEL=gpt-4.1-mini
+AGENT_MODEL=gpt-5.5
 ```
+
+For GPT-5 and o-series models the client sends `reasoning_effort` (from `AGENT_REASONING_EFFORT`, default `none`) instead of a temperature, which those models reject.
 
 ## Tickets
 

@@ -15,6 +15,7 @@ class Settings(BaseSettings):
     agent_model: str = "llama3.2:3b"
     agent_api_key: str = "ollama"
     agent_max_steps: int = 10
+    agent_reasoning_effort: str = "none"
 
     agent_timeout_seconds: float = 90.0
     inbound_per_sender_per_minute: int = 12
