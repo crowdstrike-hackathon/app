@@ -18,6 +18,7 @@ _runtime: dict[str, list[dict]] = {}
 _inbound: list[dict] = []
 _receipts: dict[str, str] = {}
 _mail: dict[str, list[dict]] = {}
+_status: dict[str, dict[str, dict]] = {}
 _store = MailStore()
 _next = FIRST_ID
 
@@ -29,6 +30,7 @@ def open_store(path: str | Path = ":memory:") -> MailStore:
     _inbound.clear()
     _receipts.clear()
     _mail.clear()
+    _status.clear()
     _next = FIRST_ID
     for ticket, seq, receipt in _store.tickets():
         _inbound.append(ticket)
@@ -36,6 +38,8 @@ def open_store(path: str | Path = ":memory:") -> MailStore:
         _next = max(_next, seq + 1)
     for ticket_id, message in _store.mail():
         _mail.setdefault(ticket_id, []).append(message)
+    for user_id, ticket_id, data in _store.statuses():
+        _status.setdefault(user_id, {})[ticket_id] = data
     return _store
 
 
@@ -77,6 +81,20 @@ def receive(raw: dict) -> tuple[dict, str]:
     _inbound.append(ticket)
     _receipts[_digest(receipt)] = ticket["id"]
     return ticket, receipt
+
+
+def set_status(user_id: str, ticket_id: str, data: dict) -> None:
+    _status.setdefault(user_id, {})[ticket_id] = data
+    _store.save_status(user_id, ticket_id, data)
+
+
+def clear_status(user_id: str, ticket_id: str) -> None:
+    _status.get(user_id, {}).pop(ticket_id, None)
+    _store.drop_status(user_id, ticket_id)
+
+
+def status_of(user_id: str, ticket_id: str) -> dict | None:
+    return _status.get(user_id, {}).get(ticket_id)
 
 
 def inbound_ticket(ticket_id: str) -> dict | None:
@@ -174,4 +192,6 @@ def _load_file_tickets() -> tuple[list[dict], dict]:
 def load_tickets(user_id: str = "") -> tuple[list[dict], dict]:
     tickets, info = _load_file_tickets()
     runtime = _runtime.get(user_id, [])
-    return tickets + list(runtime) + list(_inbound), {**info, "runtime_count": len(runtime), "inbound_count": len(_inbound)}
+    status = _status.get(user_id, {})
+    items = [{**t, "status": status.get(t["id"])} for t in tickets + list(runtime) + list(_inbound)]
+    return items, {**info, "runtime_count": len(runtime), "inbound_count": len(_inbound)}

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Literal, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -16,12 +16,13 @@ from ..agent.llm import LLMError, model_status
 from ..auth import decode_token, get_current_user
 from ..db import SessionLocal, get_db
 from ..engine.chat import Chat, store
+from ..engine.history import mark_handling, record_turn
 from ..engine.preview import preview
 from ..orm import RunRecord, User
 from ..riposte import Policy
 from ..riposte.baseline import _PATTERNS
 from ..world.seed import COMPANY, KB
-from ..world.tickets import add_ticket, load_tickets
+from ..world.tickets import add_ticket, clear_status, load_tickets, set_status, status_of
 from ..world.world import World, tool_catalog
 
 router = APIRouter(prefix="/api")
@@ -113,6 +114,33 @@ def tickets(user: User = Depends(get_current_user)) -> dict:
     return {"tickets": items, "file": info}
 
 
+def _known(ticket_id: str, user: User) -> str:
+    items, _ = load_tickets(user.id)
+    match = next((t["id"] for t in items if t["id"].upper() == ticket_id.upper()), None)
+    if match is None:
+        raise HTTPException(404, "No ticket with that id")
+    return match
+
+
+@router.post("/tickets/{ticket_id}/dismiss")
+def dismiss_ticket(ticket_id: str, user: User = Depends(get_current_user)) -> dict:
+    ticket_id = _known(ticket_id, user)
+    previous = status_of(user.id, ticket_id) or {}
+    set_status(user.id, ticket_id, {**previous, "state": "dismissed", "updated_at": datetime.now(timezone.utc).isoformat()})
+    return {"ok": True}
+
+
+@router.post("/tickets/{ticket_id}/reopen")
+def reopen_ticket(ticket_id: str, user: User = Depends(get_current_user)) -> dict:
+    ticket_id = _known(ticket_id, user)
+    previous = status_of(user.id, ticket_id) or {}
+    if previous.get("runs"):
+        set_status(user.id, ticket_id, {"state": "open", "runs": previous["runs"], "updated_at": datetime.now(timezone.utc).isoformat()})
+    else:
+        clear_status(user.id, ticket_id)
+    return {"ok": True}
+
+
 @router.post("/tickets/{ticket_id}/preview")
 async def preview_ticket(ticket_id: str, fresh: bool = Query(False), user: User = Depends(get_current_user)) -> dict:
     items, _ = load_tickets(user.id)
@@ -172,9 +200,11 @@ async def _persist(chat: Chat) -> None:
 
 
 async def _drive(chat: Chat, turn: dict) -> None:
+    mark_handling(chat, turn)
     try:
         await chat.run_turn(turn)
     finally:
+        record_turn(chat, turn)
         await asyncio.shield(_persist(chat))
 
 
