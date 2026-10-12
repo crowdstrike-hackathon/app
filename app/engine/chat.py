@@ -8,7 +8,7 @@ from typing import Any, Optional
 from uuid import uuid4
 
 from ..agent.llm import LLMError, chat_json
-from ..agent.prompt import operator_prompt, result_prompt, retry_prompt, system_prompt
+from ..agent.prompt import intent_messages, operator_prompt, result_prompt, retry_prompt, system_prompt
 from ..config import settings
 from ..riposte import REQUESTER, UNTRUSTED, Decision, Gateway, KeywordFilter, Policy
 from ..riposte.taint import destination_key
@@ -150,16 +150,17 @@ class Chat:
 
     def begin(self, message: str, tickets: list[dict]) -> dict:
         self.world.tickets = {t["id"].upper(): t for t in tickets}
-        self.world.requester = ""
-        if self.gateway:
-            self.gateway.requester = None
-            self.gateway.scope = None
         index = len(self.turns)
         refs = self._refs(message)
+        if refs:
+            self.world.requester = ""
+            if self.gateway:
+                self.gateway.requester = None
+                self.gateway.scope = None
         if not self.title:
             self.title = message[:300]
         turn = {
-            "index": index, "message": message, "refs": refs, "status": "running", "outcome": "", "summary": "",
+            "index": index, "message": message, "refs": refs, "intent": "", "status": "running", "outcome": "", "summary": "",
             "answer": "", "acted": False, "incidents": [],
             "stats": {"steps": 0, "blocked": 0, "held": 0, "approved": 0, "denied": 0},
         }
@@ -199,11 +200,12 @@ class Chat:
         elif state["quarantined"]:
             outcome, summary = "quarantined", "The keyword filter quarantined the ticket before the agent could act on it."
         elif stats["blocked"]:
-            outcome, summary = "blocked", f"Riposte blocked {stats['blocked']} tool call(s). Nothing confidential left the sandbox."
+            calls = "1 tool call" if stats["blocked"] == 1 else f"{stats['blocked']} tool calls"
+            outcome, summary = "blocked", f"Riposte blocked {calls}. Nothing confidential left the sandbox."
         elif stats["held"]:
-            outcome, summary = "reviewed", "A person reviewed the held action. Nothing confidential left the sandbox."
+            outcome, summary = "reviewed", "Riposte held an action until a person decided. Nothing confidential left the sandbox."
         else:
-            outcome, summary = "clean", "Handled with no policy violations."
+            outcome, summary = "clean", "Every tool call was within policy."
         turn["outcome"], turn["summary"] = outcome, summary
         for future in self._holds.values():
             if not future.done():
@@ -276,10 +278,20 @@ class Chat:
         self.emit("hold_resolved", turn=turn["index"], step=step, hold_id=hold_id, approved=approved)
         return approved
 
+    async def _intent(self) -> str:
+        try:
+            verdict = await chat_json(intent_messages([t["message"] for t in self.turns]))
+        except LLMError:
+            return "task"
+        return "question" if str(verdict.get("intent", "")).strip().lower() == "question" else "task"
+
     async def _loop(self, turn: dict, state: dict) -> None:
         index, stats = turn["index"], turn["stats"]
-        prompt = operator_prompt(turn["message"], turn["refs"])
+        turn["intent"] = await self._intent()
+        self.emit("intent", turn=index, intent=turn["intent"])
+        prompt = operator_prompt(turn["message"], turn["refs"], turn["intent"])
         if self.gateway:
+            self.gateway.authorized = turn["intent"] == "task"
             self.gateway.trust(prompt, "the operator's message")
         self.messages.append({"role": "user", "content": prompt})
         for _ in range(settings.agent_max_steps):

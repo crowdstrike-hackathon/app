@@ -26,6 +26,7 @@ call: where did this argument come from, and is this action allowed to be driven
 - After the agent has read confidential data, sending to an address that no trusted source provided is blocked. Sending anywhere other than the owner is held.
 - Refunds above $200, or to a different customer than the ticket's, are held for a person.
 - A reply that contains a key is blocked unless the ticket sender is the key's owner.
+- If the operator only asked a question, any action (fetching a key, refunding, emailing, replying to the customer) is blocked. Whether it was a question is judged from the operator's own messages only, never from ticket text.
 
 ## Modes
 

@@ -71,6 +71,7 @@ class Gateway:
         self.read_owners: dict[str, Secret] = {}
         self.requester: Optional[str] = None
         self.scope: Optional[str] = None
+        self.authorized = True
         self.step = 0
 
     def trust(self, text: str, origin: str) -> None:
@@ -126,8 +127,19 @@ class Gateway:
         dom = domain_of(dest)
         return any(dom == d or dom.endswith("." + d) for d in self.policy.internal_domains)
 
+    def _unrequested(self, name: str, evidence: list[Evidence]) -> Decision:
+        return Decision(
+            "block", "intent", "The operator did not ask for this",
+            f"The operator asked a question and did not ask for any action. {name} was prompted by content "
+            f"the agent read, not by the operator.",
+            evidence,
+        )
+
     def check(self, tool: Tool, args: dict) -> Decision:
         evidence = self.annotate(tool, args)
+
+        if not self.authorized and (tool.sends or tool.amount or tool.confidential):
+            return self._unrequested(tool.name, evidence)
 
         if tool.scope and self.policy.enforce_scope and self.scope:
             asked = str(args.get(tool.scope, "")).strip().upper()
@@ -212,6 +224,8 @@ class Gateway:
         return Decision(evidence=evidence)
 
     def check_reply(self, text: str) -> Decision:
+        if not self.authorized:
+            return self._unrequested("reply", [Evidence("message", text[:240], UNKNOWN, [])])
         dest = self.requester or ""
         for secret, how in self._secrets_in(text):
             if dest not in secret.allowed:
