@@ -117,6 +117,12 @@ class Gateway:
                 )
         return None
 
+    def secrets_at_risk(self, dest: str) -> list[Secret]:
+        """Secrets the agent has read that this destination is not allowed to learn anything about."""
+        if dest and self._is_internal(dest):
+            return []
+        return [s for s in self.secrets if dest not in s.allowed]
+
     def register_secret(self, secret: Secret) -> None:
         self.secrets.append(secret)
         self.read_owners[secret.owner_id] = secret

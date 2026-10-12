@@ -27,6 +27,7 @@ call: where did this argument come from, and is this action allowed to be driven
 - Refunds above $200, or to a different customer than the ticket's, are held for a person.
 - A reply that contains a key is blocked unless the ticket sender is the key's owner.
 - If the operator only asked a question, any action (fetching a key, refunding, emailing, replying to the customer) is blocked. Whether it was a question is judged from the operator's own messages only, never from ticket text.
+- Twin run: before a reply or email goes to someone who may not see a key the agent has read, the agent's last step is asked again with a decoy key. If the decoy changes the message, the message depends on the real key (for example its last few characters, or a yes/no answer about it) and is blocked, even though the key itself is not in it.
 
 ## Modes
 
