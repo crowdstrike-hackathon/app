@@ -118,6 +118,43 @@ class Gateway:
                 )
         return None
 
+    def flows(self, tool: Tool, args: dict, rule: str = "") -> dict:
+        """Where each argument of this call came from, for the flow map. Records only, never blocks."""
+        out: list[dict] = []
+        seen: set[tuple] = set()
+
+        def add(arg: str, origin: str, trust: str, carries: str) -> None:
+            key = (arg, origin, carries)
+            if key not in seen:
+                seen.add(key)
+                out.append({"arg": arg, "origin": origin, "trust": trust, "carries": carries})
+
+        free_text = set(tool.payload) | {"message"}
+        for e in self.annotate(tool, args):
+            # Message text is checked for secrets and customer details below; tracing its words would link
+            # everyday phrases ("API key") to whatever source happens to contain them.
+            if e.arg not in free_text and e.source in (TRUSTED, UNTRUSTED, REQUESTER):
+                for origin in e.origins:
+                    add(e.arg, origin, e.source, "value")
+        for name in tool.params:
+            text = str(args.get(name, "") or "")
+            if not text:
+                continue
+            for secret in self.secrets:
+                if secret.found_in(text):
+                    add(name, "the key vault", TRUSTED, "secret")
+            for record in self.records.values():
+                if record.found_in(text):
+                    add(name, f"the customer record for {record.owner_name}", TRUSTED, "record")
+        if rule == "twin" and self.secrets:
+            add(tool.params[0] if tool.params else "message", "the key vault", TRUSTED, "derived")
+        to = None
+        if tool.destination:
+            to = destination_key(str(args.get(tool.destination, ""))) or None
+        elif tool.name == "reply":
+            to = self.requester
+        return {"flows": out, "to": to}
+
     def secrets_at_risk(self, dest: str) -> list[Secret]:
         """Secrets the agent has read that this destination is not allowed to learn anything about."""
         if dest and self._is_internal(dest):
