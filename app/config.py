@@ -18,6 +18,9 @@ class Settings(BaseSettings):
 
     agent_timeout_seconds: float = 90.0
     inbound_per_sender_per_minute: int = 12
+    auto_handle_inbound: bool = False
+    auto_handle_as: str = ""
+    auto_handle_hold_seconds: float = 120.0
 
     tickets_path: str = "tickets.json"
     tickets_fallback_path: str = "tickets.sample.json"

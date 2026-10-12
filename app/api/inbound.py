@@ -5,6 +5,7 @@ from fastapi import APIRouter, Header, HTTPException, Query, Request
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from ..config import settings
+from ..engine import autohandle
 from ..riposte.taint import destination_key
 from ..world import tickets
 
@@ -50,6 +51,7 @@ async def receive_ticket(request: Request):
         raise HTTPException(422, "from must be an email address")
     rate_limit(sender)
     ticket, receipt = tickets.receive(body.model_dump(by_alias=True))
+    autohandle.submit(ticket["id"])
     return {"ticket_id": ticket["id"], "receipt": receipt}
 
 
