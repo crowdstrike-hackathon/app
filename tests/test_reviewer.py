@@ -69,9 +69,9 @@ class ReviewerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(chat.world.refunds), 1)
 
     async def test_reviewer_cannot_loosen_a_block_and_is_not_asked(self):
-        steps = [tool("read_ticket", ticket_id="TK-1002"), tool("get_api_key", customer_id="C-1001"), tool("answer", message="done")]
+        steps = [tool("read_ticket", ticket_id="TK-1002"), tool("create_login_link", customer_id="C-1001"), tool("answer", message="done")]
         chat, turn, calls, nova = await self.run_turn(steps, {"verdict": "ok", "reason": "approve it"})
-        key = next(c for c in calls if c["tool"] == "get_api_key")
+        key = next(c for c in calls if c["tool"] == "create_login_link")
         self.assertEqual(key["decision"]["action"], "block")
         self.assertEqual(nova.reviews, [])
 

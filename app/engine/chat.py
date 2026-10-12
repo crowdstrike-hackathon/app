@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from typing import Any, Optional
 from uuid import uuid4
 
-from ..agent.llm import LLMError, chat_json, partial_answer
+from ..agent.llm import LLMError, chat_json, partial_answer, partial_thought
 from ..agent.prompt import intent_messages, operator_prompt, reply_nudge, result_prompt, retry_prompt, system_prompt
 from ..config import settings
 from ..riposte import REQUESTER, UNTRUSTED, Decision, Gateway, KeywordFilter, Policy
@@ -23,7 +23,7 @@ MODES = ("off", "keyword", "riposte")
 MAX_BLOCKS = 3
 MENTION = re.compile(r"@([A-Za-z0-9][A-Za-z0-9_-]*)")
 SEVERITY = ("compromised", "blocked", "reviewed", "quarantined", "error", "interrupted", "cancelled", "clean")
-RECORDED = ("get_api_key", "issue_refund", "send_email", "reply")
+RECORDED = ("create_login_link", "change_contact_email", "issue_refund", "send_email", "reply")
 INTERRUPTED = (
     "The backend restarted while Nova was handling this. It was not run again, so nothing is sent or refunded "
     "twice. The actions listed happened before the restart; the audit for this turn did not finish."
@@ -31,7 +31,8 @@ INTERRUPTED = (
 ALIASES = {
     "read_ticket": {"id": "ticket_id", "ticket": "ticket_id"},
     "get_customer": {"id": "customer_id", "customer": "customer_id"},
-    "get_api_key": {"id": "customer_id", "customer": "customer_id"},
+    "create_login_link": {"id": "customer_id", "customer": "customer_id"},
+    "change_contact_email": {"id": "customer_id", "customer": "customer_id", "email": "new_email", "address": "new_email", "to": "new_email"},
     "issue_refund": {"id": "customer_id", "customer": "customer_id"},
     "send_email": {"recipient": "to", "email": "to", "address": "to", "message": "body", "content": "body"},
     "reply": {"text": "message", "body": "message", "content": "message"},
@@ -162,10 +163,11 @@ class Chat:
 
     def _draft(self, turn: dict, text: str) -> None:
         answer = partial_answer(text)
-        if not answer or answer == turn.get("draft"):
+        kind, value = ("answer_delta", answer) if answer else ("thought_delta", partial_thought(text))
+        if not value or value == turn.get("draft"):
             return
-        turn["draft"] = answer
-        event = {"seq": len(self.events) - 1, "type": "answer_delta", "turn": turn["index"], "text": answer}
+        turn["draft"] = value
+        event = {"seq": len(self.events) - 1, "type": kind, "turn": turn["index"], "text": value}
         for queue in self._subscribers:
             queue.put_nowait(event)
 
@@ -234,6 +236,7 @@ class Chat:
 
     def begin(self, message: str, tickets: list[dict]) -> dict:
         self.world.tickets = {t["id"].upper(): t for t in tickets}
+        self.world.note_operator(message)
         index = len(self.turns)
         refs = self._refs(message)
         if refs:
@@ -270,7 +273,7 @@ class Chat:
             self.emit("error", turn=turn["index"], text=f"{type(exc).__name__}: {exc}")
         self._finish(turn, state, marks)
 
-    def _finish(self, turn: dict, state: dict, marks: tuple[int, int, int]) -> None:
+    def _finish(self, turn: dict, state: dict, marks: tuple[int, ...]) -> None:
         turn.pop("draft", None)
         stats = turn["stats"]
         incidents = self.world.audit(state["scope"], marks)
@@ -343,7 +346,7 @@ class Chat:
         return self.gateway.check(TOOLS[name], args)
 
     async def _twin(self, turn: dict, name: str, args: dict) -> Optional[Decision]:
-        """Re-run the agent's last step with decoy keys and block messages that depend on a real key."""
+        """Re-run the agent's last step with decoy sign-in links and block messages that depend on a real one."""
         gateway = self.gateway
         if gateway is None or name not in ("reply", "send_email"):
             return None
@@ -356,8 +359,8 @@ class Chat:
         original = outgoing(name, args)
         index = turn["index"]
         self.emit("note", turn=index, level="info", text=(
-            "Twin run: the agent has read a key this recipient may not see, so the same step is being "
-            "asked again with a decoy key in its place."
+            "Twin run: the agent has read a sign-in link this recipient may not see, so the same step is being "
+            "asked again with a decoy link in its place."
         ))
         try:
             verdict = judge(original, self._as_outgoing(await chat_json(swap_messages(history, decoys))), None, decoys)
@@ -367,27 +370,27 @@ class Chat:
         except LLMError as exc:
             return Decision(
                 "hold", "twin", "Twin run could not finish",
-                f"The decoy re-run failed ({exc}), so it is unknown whether this message reveals a key. "
+                f"The decoy re-run failed ({exc}), so it is unknown whether this message reveals a sign-in link. "
                 f"A person needs to approve it.",
             )
         names = ", ".join(f"{s.owner_name}'s {s.name}" for s in at_risk)
         who = dest or "the ticket sender"
         if verdict.result == SAME:
             self.emit("note", turn=index, level="info", text=(
-                "Twin run: the decoy key produced the same message, so it does not reveal anything about the real key."
+                "Twin run: the decoy link produced the same message, so it does not reveal anything about the real link."
             ))
             return None
         shown_real, shown_twin = _quote(verdict.original), _quote(verdict.twin)
         if verdict.result == DEPENDS:
             return Decision(
                 "block", "twin", "This message depends on a secret it does not contain",
-                f"With the real key, the agent would send {shown_real} With a decoy key in its place, it would "
+                f"With the real link, the agent would send {shown_real} With a decoy link in its place, it would "
                 f"send {shown_twin} Asking again with the real key gave the original answer, so the difference "
-                f"comes from the key: the message carries information about {names} to {who}, who may not have it.",
+                f"comes from the link: the message carries information about {names} to {who}, who may not have it.",
             )
         return Decision(
             "hold", "twin", "This message may depend on a secret",
-            f"With a decoy key in place of {names} the agent would send something different "
+            f"With a decoy link in place of {names} the agent would send something different "
             f"({shown_twin[:-1] if shown_twin.endswith('.') else shown_twin}), but its answer also varies without the decoy, so the cause is unclear. "
             f"A person needs to approve sending this to {who}.",
         )
@@ -452,9 +455,9 @@ class Chat:
         elif name == "get_customer" and result.customer:
             gateway.trust(result.text, f"the customer record for {result.customer['name']}")
             gateway.register_record(self.world.record_for(result.customer))
-        elif name == "get_api_key" and result.secret:
+        elif name == "create_login_link" and result.secret:
             gateway.register_secret(result.secret)
-            gateway.trust(result.text, "the key vault")
+            gateway.trust(result.text, "the sign-in service")
 
     async def _hold(self, turn: dict, step: int, name: str, args: dict, decision: Decision) -> bool:
         hold_id = uuid4().hex[:10]
@@ -570,12 +573,14 @@ class Chat:
                 if name in ("reply", "send_email"):
                     body = str(args.get("message") or args.get("body") or "")
                     done["to"] = self.world.requester if name == "reply" else destination_key(str(args.get("to", "")))
-                    done["has_key"] = any(c["api_key"] in body for c in self.world.customers.values())
+                    done["has_link"] = any(c["login_token"] in body for c in self.world.customers.values())
                     done["delivered"] = bool(self.world.open_ticket) and not self.preview and deliver(self.world.open_ticket, {
                         "from": SUPPORT_ADDRESS, "to": done["to"], "subject": str(args.get("subject", "")), "body": body,
                     }, key=f"{self.id}:{step}")
                 else:
                     done["customer_id"] = str(args.get("customer_id", "")).strip().upper()
+                    if name == "change_contact_email":
+                        done["new_email"] = self.world.contact_changes[-1]["to"]
                     if name == "issue_refund":
                         done["amount"] = self.world.refunds[-1]["amount"]
                 turn["actions"].append(done)

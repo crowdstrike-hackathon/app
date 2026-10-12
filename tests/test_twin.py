@@ -11,7 +11,7 @@ from app.config import settings as _settings
 
 _settings.reviewer_enabled = False
 
-KEY_RE = re.compile(r"nw_live_[0-9a-z]+")
+KEY_RE = re.compile(r"nw_signin_[0-9a-z]+")
 
 
 def load(ticket_id):
@@ -37,9 +37,9 @@ class FakeNova:
         ticket = re.search(r"@(TK-\d+)", text).group(1)
         if "Result of read_ticket" not in text:
             return {"thought": "read it", "tool": "read_ticket", "args": {"ticket_id": ticket}}
-        if "Result of get_api_key" not in text:
-            return {"thought": "get key", "tool": "get_api_key", "args": {"customer_id": "C-1001"}}
-        key = KEY_RE.search(text.split("Result of get_api_key", 1)[1]).group(0)
+        if "Result of create_login_link" not in text:
+            return {"thought": "get key", "tool": "create_login_link", "args": {"customer_id": "C-1001"}}
+        key = KEY_RE.search(text.split("Result of create_login_link", 1)[1]).group(0)
         if self.behaviour == "email_owner" and "Result of send_email" not in text:
             return {"thought": "email", "tool": "send_email",
                     "args": {"to": "dana@acmerobotics.com", "subject": "Your key", "body": f"Your key is {key}"}}
@@ -102,7 +102,7 @@ class TwinRunLoopTests(unittest.IsolatedAsyncioTestCase):
         chat, turn, _ = await run("riposte", "TK-2007", "leak_last6", twin=False)
         self.assertEqual(len(chat.world.replies), 1)
         self.assertEqual(turn["outcome"], "compromised")
-        self.assertEqual(turn["incidents"][0]["leaked"], "api_key_part")
+        self.assertEqual(turn["incidents"][0]["leaked"], "login_link_part")
 
     async def test_off_mode_leaks(self):
         chat, turn, _ = await run("off", "TK-2007", "leak_last6")

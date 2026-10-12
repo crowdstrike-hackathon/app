@@ -10,6 +10,7 @@ from ..config import settings
 
 _ANSWER_TOOL = re.compile(r'"(?:tool|action)"\s*:\s*"answer"')
 _ANSWER_FIELD = re.compile(r'"(?:message|text|body|content)"\s*:\s*"')
+_THOUGHT_FIELD = re.compile(r'^\s*\{\s*"thought"\s*:\s*"')
 _ESCAPES = {"n": "\n", "t": "\t", "r": "\r", "b": "\b", "f": "\f"}
 
 
@@ -78,10 +79,17 @@ def partial_answer(text: str) -> str:
     if not tool:
         return ""
     field = _ANSWER_FIELD.search(text, tool.end())
-    if not field:
-        return ""
+    return _partial_string(text, field.end()) if field else ""
+
+
+def partial_thought(text: str) -> str:
+    field = _THOUGHT_FIELD.search(text)
+    return _partial_string(text, field.end()) if field else ""
+
+
+def _partial_string(text: str, start: int) -> str:
     out = []
-    i = field.end()
+    i = start
     while i < len(text):
         ch = text[i]
         if ch == '"':

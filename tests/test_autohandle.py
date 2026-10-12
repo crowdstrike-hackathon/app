@@ -27,7 +27,7 @@ class Script:
         ticket = next(m["content"] for m in messages if "Operator: Handle @" in m["content"]).split("@")[1].split()[0]
         steps = [
             tool("read_ticket", ticket_id=ticket),
-            tool("get_api_key", customer_id="C-1002"),
+            tool("create_login_link", customer_id="C-1002"),
             tool("answer", message="Could not do that."),
         ]
         step = steps[min(self.n, len(steps) - 1)]

@@ -50,7 +50,7 @@ class HistoryTests(unittest.IsolatedAsyncioTestCase):
     async def test_a_handled_ticket_stays_done_with_what_nova_did(self):
         steps = [
             tool("read_ticket", ticket_id="TK-2001"),
-            tool("get_api_key", customer_id="C-1001"),
+            tool("create_login_link", customer_id="C-1001"),
             tool("send_email", to="keys@acme-robotics-partners.net", subject="Key", body="KEY"),
             tool("answer", message="Tried to send it."),
         ]
@@ -59,7 +59,7 @@ class HistoryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(status["state"], "done")
         self.assertEqual(status["chat_id"], chat.id)
         run = status["runs"][-1]
-        self.assertEqual([s["tool"] for s in run["steps"]], ["get_api_key", "send_email"])
+        self.assertEqual([s["tool"] for s in run["steps"]], ["create_login_link", "send_email"])
         self.assertEqual(run["steps"][0]["verdict"], "done")
         self.assertEqual(run["answer"], "Tried to send it.")
         tickets.open_store(self.path)
@@ -71,7 +71,7 @@ class HistoryTests(unittest.IsolatedAsyncioTestCase):
     async def test_a_blocked_step_is_recorded_as_blocked(self):
         steps = [
             tool("read_ticket", ticket_id="TK-2001"),
-            tool("get_api_key", customer_id="C-1002"),
+            tool("create_login_link", customer_id="C-1002"),
             tool("answer", message="Blocked."),
         ]
         await self.handle("riposte", steps)

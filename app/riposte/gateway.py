@@ -22,6 +22,7 @@ class Tool:
     scope: Optional[str] = None
     amount: Optional[str] = None
     confidential: bool = False
+    contact: Optional[str] = None
 
     @property
     def sends(self) -> bool:
@@ -142,12 +143,12 @@ class Gateway:
                 continue
             for secret in self.secrets:
                 if secret.found_in(text):
-                    add(name, "the key vault", TRUSTED, "secret")
+                    add(name, "the sign-in service", TRUSTED, "secret")
             for record in self.records.values():
                 if record.found_in(text):
                     add(name, f"the customer record for {record.owner_name}", TRUSTED, "record")
         if rule == "twin" and self.secrets:
-            add(tool.params[0] if tool.params else "message", "the key vault", TRUSTED, "derived")
+            add(tool.params[0] if tool.params else "message", "the sign-in service", TRUSTED, "derived")
         to = None
         if tool.destination:
             to = destination_key(str(args.get(tool.destination, ""))) or None
@@ -223,7 +224,7 @@ class Gateway:
     def check(self, tool: Tool, args: dict) -> Decision:
         evidence = self.annotate(tool, args)
 
-        if not self.authorized and (tool.sends or tool.amount or tool.confidential):
+        if not self.authorized and (tool.sends or tool.amount or tool.confidential or tool.contact):
             return self._unrequested(tool.name, evidence)
 
         if tool.scope and self.policy.enforce_scope and self.scope:
@@ -235,6 +236,16 @@ class Gateway:
                     f"so it would read another customer's confidential data.",
                     evidence,
                 )
+            if tool.contact and asked and asked != self.scope.upper():
+                return Decision(
+                    "block", "scope", "Outside this ticket's customer",
+                    f"This ticket belongs to {self.scope}. {tool.name} was called for {asked}, "
+                    f"so it would change who controls another customer's account.",
+                    evidence,
+                )
+
+        if tool.contact:
+            return self._check_contact(tool, args, evidence)
 
         if tool.amount and tool.scope and self.policy.enforce_scope and self.scope:
             asked = str(args.get(tool.scope, "")).strip().upper()
@@ -322,6 +333,30 @@ class Gateway:
         if self._is_internal(dest):
             return Decision(evidence=evidence)
         return self._confirm(tool.name, evidence)
+
+    def _check_contact(self, tool: Tool, args: dict, evidence: list[Evidence]) -> Decision:
+        address = destination_key(str(args.get(tool.contact, "")))
+        if self.read_owners:
+            names = ", ".join(f"{s.owner_name}'s {s.name}" for s in self.read_owners.values())
+            return Decision(
+                "block", "contact", "Contact email change after a sign-in link was created",
+                f"{tool.name} would make {address} the address on file. The agent has already read {names}, "
+                f"and a new address on file could then receive it, so the address cannot change in this conversation.",
+                evidence,
+            )
+        source, origins = self.trace(address)
+        record = self.records.get(str(args.get(tool.scope, "")).strip().upper())
+        own_record = f"the customer record for {record.owner_name}" if record else ""
+        vouched = [o for o in origins if o in ("the operator's message", own_record)]
+        if source == TRUSTED and vouched:
+            return Decision(evidence=evidence)
+        where = f"it appears only in {origins[0]}" if source == UNTRUSTED else "neither the operator nor this customer's record gave it"
+        return Decision(
+            "hold", "contact", "New contact email was not given by a trusted source",
+            f"{tool.name} would make {address} the address on file; {where}. Whoever holds the address on file "
+            f"can sign in to the account, so a person needs to approve it.",
+            evidence,
+        )
 
     def check_reply(self, text: str) -> Decision:
         if not self.authorized:
