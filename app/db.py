@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import AsyncGenerator
+from importlib import import_module
 
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
@@ -25,7 +26,7 @@ async def get_db() -> AsyncGenerator[AsyncSession, None]:
 
 
 async def init_db() -> None:
-    from . import orm  # noqa: F401
+    import_module(".orm", __package__)
 
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)

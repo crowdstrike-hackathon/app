@@ -1,85 +1,92 @@
-# Sentinel — Agentic Red vs Blue SOC Simulation (backend)
+# Riposte (backend)
 
-Charlotte-style defender AI, continuously pressure-tested by an adversary AI, at scale.
+A provenance-based firewall for AI agent tool calls. Built for Track 3 of the AIC x CrowdStrike
+hackathon: build an agent and defend it against prompt injection, tool misuse and data exfiltration.
 
-A simulation engine runs a **red agent** (adversary) against a **blue agent** (defender)
-turn by turn over a fictional company's logs:
+Most guardrails read the incoming text and guess whether it looks like an attack. Riposte ignores
+the wording. It records where every piece of text the agent reads came from, then checks each tool
+call: where did this argument come from, and is this action allowed to be driven by that source?
 
-- **Red** picks the next MITRE ATT&CK technique and emits *synthetic log telemetry* —
-  mixing real attack signal with **planted decoys** (spoofed sources, tampered timestamps,
-  lures) and benign noise. It never touches real systems and never emits exploit code; it
-  produces log lines only. In `live` mode it is driven by a local uncensored model on an
-  A100 (OpenAI-compatible endpoint) — a real adversary, not a canned script.
-- **Blue** (the product) ingests the stream *without* ground truth, reasons through the
-  deception, reaches a verdict, and proposes **governed response actions** gated behind
-  human-in-the-loop approval. In `live` mode it is Claude.
+## What is in here
 
-Every run is scored (detection speed, decoys seen through, real signal wrongly distrusted,
-false positives), owned by an authenticated user, and persisted to Postgres.
+| Path | What it does |
+| --- | --- |
+| `app/riposte/taint.py` | Normalises text, sees through base64, hex, URL encoding, rot13, reversal and homoglyphs, and finds secrets in outgoing text |
+| `app/riposte/gateway.py` | The firewall. Labels what the agent reads (trusted, untrusted, requester) and returns allow, hold or block for each tool call, with evidence |
+| `app/riposte/baseline.py` | The keyword filter used as the comparison baseline |
+| `app/world/` | The sandbox: three customers with API keys, a help center, and the tools `read_ticket`, `search_kb`, `get_customer`, `get_api_key`, `issue_refund`, `send_email`, `reply` |
+| `app/agent/` | The agent prompt and the client for the local model |
+| `app/engine/runs.py` | The agent loop. One JSON action per turn, every call goes through the gateway, held calls wait for a person |
+| `app/api/routes.py` | FastAPI routes and the server-sent event stream |
 
-## Stack
+## The rules the gateway enforces
 
-FastAPI · SQLAlchemy 2 (async) · Postgres (asyncpg) · JWT auth (bcrypt) · SSE streaming.
+- A customer's API key may only be sent to that customer's address on file. Anything else is blocked, including encoded or partial copies of the key.
+- A ticket can only read confidential data for its own customer account.
+- After the agent has read confidential data, sending to an address that no trusted source provided is blocked. Sending anywhere other than the owner is held.
+- Refunds above $200, or to a different customer than the ticket's, are held for a person.
+- A reply that contains a key is blocked unless the ticket sender is the key's owner.
+
+## Modes
+
+- `off`: every tool call runs.
+- `keyword`: the ticket text is scanned for known injection phrases. A match quarantines the ticket; otherwise nothing else is checked.
+- `riposte`: every tool call goes through the gateway.
+
+After each run the sandbox is audited independently of the gateway, so the outcome (`compromised`,
+`blocked`, `reviewed`, `quarantined`, `clean`) reflects what actually left the sandbox.
 
 ## Run
 
 ```bash
+ollama pull llama3.2:3b
+
 cd app/app
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-cp .env.example .env
-
-# Postgres (recommended):
-docker compose up -d db          # starts postgres on :5432 matching .env
-
-uvicorn app.main:app --reload    # http://localhost:8000
+uvicorn app.main:app --port 8000
 ```
 
-Tables are created automatically on startup. Without Docker, leave `DATABASE_URL` unset
-to fall back to a local SQLite file (`sentinel.db`) so the app still boots for a demo.
+Settings are read from `.env` (see `.env.example`). The default database is a local SQLite file.
 
-`SIM_MODE=mock` (default) runs fully offline and deterministic. Flip to `SIM_MODE=live`
-and fill in `ANTHROPIC_API_KEY` (blue) and `RED_MODEL_*` (red) to use real models.
+## Tickets
+
+Tickets are loaded from `tickets.json` in this directory on every request, so edits show up without
+a restart. If that file does not exist, `tickets.sample.json` is used.
+
+```json
+{
+  "tickets": [
+    {
+      "id": "TK-1001",
+      "from": "dana@acmerobotics.com",
+      "customer_id": "C-1001",
+      "subject": "Lost our API key",
+      "body": "Could you email our API key to the address on file?",
+      "kind": "benign",
+      "title": "Lost API key"
+    }
+  ]
+}
+```
+
+`id`, `from`, `subject` and `body` are required. `customer_id` is the account the helpdesk matched
+the sender to (`C-1001`, `C-1002`, `C-1003`, or omit it for an unknown sender). `kind` is `benign`
+or `attack` and only labels the ticket in the UI. `title` is the short name shown in the inbox.
 
 ## API
 
-| Method | Path | Auth | Purpose |
-|---|---|---|---|
-| POST | `/api/auth/register` | — | create account, returns JWT |
-| POST | `/api/auth/login` | — | sign in, returns JWT |
-| GET  | `/api/auth/me` | ✓ | current user |
-| GET  | `/api/meta` | — | mode, providers, environment, scenarios |
-| POST | `/api/sessions` | ✓ | start a scenario `{scenario_id, auto?, seed?}` |
-| GET  | `/api/sessions/{id}/stream?token=` | ✓ | **SSE**: `red_turn`/`blue_turn`/`score`/`action_update`/`finished` |
-| POST | `/api/sessions/{id}/step` | ✓ | advance one turn |
-| POST | `/api/sessions/{id}/run` | ✓ | auto-play remaining turns |
-| POST | `/api/sessions/{id}/actions/{id}/{approve\|deny\|execute}` | ✓ | human-in-the-loop gate |
-| GET  | `/api/history` | ✓ | past runs for this user |
-| GET  | `/api/stats` | ✓ | aggregate detection rate, avg score, avg detect turn |
-| POST | `/api/ingest` | ✓ | blue-only analysis of uploaded logs `{logs:[...]}` |
+All routes except `/api/meta` and `/api/auth/*` need a bearer token.
 
-The SSE endpoint authenticates via `?token=` because browsers' `EventSource` cannot send
-headers; all other endpoints use the `Authorization: Bearer` header.
-
-## Layout
-
-```
-app/
-  main.py            FastAPI app, CORS, startup table creation
-  config.py          pydantic-settings (mock/live, DB, JWT)
-  db.py / orm.py     async engine + User/Run/Event/Investigation/Action tables
-  auth.py            bcrypt hashing, JWT, get_current_user dependency
-  models.py          pydantic schemas (LogEvent, Investigation, ResponseAction, Score)
-  llm/provider.py    Claude (blue) + local OpenAI-compatible (red) behind one interface
-  sim/               environment, ATT&CK scenarios, decoy/noise generators
-  agents/            red_agent (emits telemetry), blue_agent (reasons -> verdict)
-  engine/session.py  turn loop, SSE pub/sub, scoring, persistence, HITL state
-  api/               auth_routes + routes
-```
-
-## Safety
-
-Red output is log telemetry and narration only; the catalog contains ATT&CK-tagged
-*descriptions* of observable activity, never runnable payloads. All response actions are
-simulated and require explicit analyst approval. `mock` mode removes any dependency on a
-live uncensored endpoint.
+| Route | Purpose |
+| --- | --- |
+| `POST /api/auth/register`, `POST /api/auth/login` | Get a token |
+| `GET /api/meta` | Model status, modes, policy, tools |
+| `GET /api/tickets` | Tickets from `tickets.json` |
+| `GET /api/world` | Customers, help-center articles, policy |
+| `POST /api/runs` | Start a run. Body: `{"mode": "riposte", "ticket_id": "TK-1001"}` or `{"mode": "off", "ticket": {"from": "...", "subject": "...", "body": "...", "customer_id": null}}` |
+| `GET /api/runs/{id}` | Snapshot of a run with all its events |
+| `GET /api/runs/{id}/stream?token=` | Server-sent events: `start`, `thinking`, `call`, `result`, `hold`, `hold_resolved`, `filter`, `note`, `error`, `done` |
+| `POST /api/runs/{id}/holds/{hold_id}` | Body `{"decision": "approve"}` or `{"decision": "deny"}` |
+| `POST /api/runs/{id}/cancel` | Stop a run |
+| `GET /api/history` | Past runs |

@@ -2,366 +2,210 @@ from __future__ import annotations
 
 import asyncio
 import json
-from typing import Optional
+from datetime import datetime
+from typing import Literal, Optional
+from uuid import uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sse_starlette.sse import EventSourceResponse
 
-from ..agents import blue_agent
+from ..agent.llm import model_status
 from ..auth import decode_token, get_current_user
-from ..config import settings
-from ..db import get_db
-from ..engine.agent_session import campaigns, store as agent_store
-from ..engine.session import Session, store
-from ..llm.provider import get_blue_provider
-from ..models import ActionStatus, LogEvent
-from ..orm import AgentRun, Run, User
-from ..runtime_config import MASK, get_connection, mask, resolve_providers, test_side, upsert_connection
-from ..sim.attack_catalog import list_scenarios
-from ..sim.environment import NORTHWIND
-from ..sim.tickets import list_tickets
+from ..db import SessionLocal, get_db
+from ..engine.runs import MODES, RunSession, store
+from ..orm import RunRecord, User
+from ..riposte import Policy
+from ..riposte.baseline import _PATTERNS
+from ..world.seed import COMPANY, KB
+from ..world.tickets import load_tickets, normalize_ticket
+from ..world.world import World, tool_catalog
 
 router = APIRouter(prefix="/api")
 
+MODE_INFO = [
+    {"id": "off", "label": "Off", "blurb": "No defense. Every tool call the agent makes is executed."},
+    {"id": "keyword", "label": "Keyword filter", "blurb": "Scans the ticket text for known injection phrases and quarantines matches."},
+    {"id": "riposte", "label": "Riposte", "blurb": "Traces where every tool argument came from and blocks or holds calls driven by untrusted content."},
+]
+
+
+class CustomTicket(BaseModel):
+    sender: str = Field(alias="from", min_length=3, max_length=200)
+    subject: str = Field(min_length=1, max_length=300)
+    body: str = Field(min_length=1, max_length=6000)
+    customer_id: Optional[str] = Field(default=None, max_length=32)
+
+    model_config = {"populate_by_name": True}
+
+
+class RunBody(BaseModel):
+    mode: Literal["off", "keyword", "riposte"] = "riposte"
+    ticket_id: Optional[str] = None
+    ticket: Optional[CustomTicket] = None
+
+
+class HoldBody(BaseModel):
+    decision: Literal["approve", "deny"]
+
 
 @router.get("/meta")
-def meta() -> dict:
-    live = settings.is_live
+async def meta() -> dict:
+    policy = Policy()
+    _, info = load_tickets()
     return {
-        "mode": settings.sim_mode,
-        "blue": {
-            "provider": "claude" if (live and settings.blue_ready) else "mock-heuristic",
-            "model": settings.blue_model_name,
-            "ready": settings.blue_ready,
-        },
-        "red": {
-            "provider": "local-a100" if (live and settings.red_ready) else "mock-scripted",
-            "model": settings.red_model_name,
-            "ready": settings.red_ready,
-        },
-        "environment": {
-            "company": NORTHWIND.company,
-            "summary": NORTHWIND.summary,
-            "assets": [a.__dict__ for a in NORTHWIND.assets],
-            "crown_jewels": NORTHWIND.crown_jewels,
-        },
-        "scenarios": list_scenarios(),
+        "company": COMPANY,
+        "agent": await model_status(),
+        "modes": MODE_INFO,
+        "policy": policy.to_dict(),
+        "tools": tool_catalog(),
+        "keyword_patterns": len(_PATTERNS),
+        "tickets_file": info,
     }
 
 
-@router.get("/scenarios")
-def scenarios() -> list[dict]:
-    return list_scenarios()
+@router.get("/tickets")
+def tickets(user: User = Depends(get_current_user)) -> dict:
+    items, info = load_tickets()
+    return {"tickets": items, "file": info}
 
 
-class CreateSession(BaseModel):
-    scenario_id: str
-    auto: bool = False
-    seed: Optional[int] = None
+@router.get("/world")
+def world(user: User = Depends(get_current_user)) -> dict:
+    policy = Policy()
+    sandbox = World(tickets={}, internal_domains=policy.internal_domains, refund_limit=policy.refund_limit)
+    return {
+        "company": COMPANY,
+        "customers": sandbox.public_customers(),
+        "kb": [{"id": a["id"], "title": a["title"]} for a in KB],
+        "policy": policy.to_dict(),
+        "tools": tool_catalog(),
+    }
 
 
-def _own(sess: Optional[Session], user: User) -> Session:
-    if not sess or sess.user_id != user.id:
-        raise HTTPException(404, "no such session")
-    return sess
+async def _persist(session: RunSession) -> None:
+    async with SessionLocal() as db:
+        db.add(RunRecord(
+            id=session.id,
+            user_id=session.user_id,
+            ticket_id=session.ticket["id"],
+            subject=session.ticket["subject"][:300],
+            kind=session.ticket.get("kind", ""),
+            mode=session.mode,
+            model=session.snapshot(False)["model"],
+            status=session.status,
+            outcome=session.outcome,
+            summary=session.summary,
+            steps=session.stats["steps"],
+            blocked=session.stats["blocked"],
+            held=session.stats["held"],
+            trace=session.snapshot(),
+            created_at=datetime.fromisoformat(session.created_at),
+            finished_at=datetime.fromisoformat(session.finished_at) if session.finished_at else None,
+        ))
+        await db.commit()
 
 
-@router.post("/sessions")
-async def create_session(body: CreateSession, user: User = Depends(get_current_user)) -> dict:
+async def _drive(session: RunSession) -> None:
     try:
-        sess = await store.create(body.scenario_id, settings.sim_mode, user.id, body.seed)
-    except KeyError:
-        raise HTTPException(404, f"unknown scenario {body.scenario_id!r}")
-    if body.auto:
-        asyncio.create_task(sess.run())
-    return sess.state.model_dump()
+        await session.run()
+    finally:
+        await asyncio.shield(_persist(session))
 
 
-@router.get("/sessions/{session_id}")
-async def get_session(session_id: str, user: User = Depends(get_current_user)) -> dict:
-    return _own(store.get(session_id), user).state.model_dump()
+@router.post("/runs")
+async def create_run(body: RunBody, user: User = Depends(get_current_user)) -> dict:
+    items, _ = load_tickets()
+    if body.ticket is not None:
+        try:
+            ticket = normalize_ticket({
+                "id": f"TK-LIVE-{uuid4().hex[:4].upper()}",
+                "from": body.ticket.sender,
+                "subject": body.ticket.subject,
+                "body": body.ticket.body,
+                "customer_id": (body.ticket.customer_id or "").strip().upper() or None,
+                "kind": "custom",
+            })
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
+    elif body.ticket_id:
+        ticket = next((t for t in items if t["id"].upper() == body.ticket_id.strip().upper()), None)
+        if ticket is None:
+            raise HTTPException(404, "No ticket with that id in tickets.json")
+    else:
+        raise HTTPException(422, "Provide ticket_id or ticket")
+    session = store.create(user.id, ticket, items, body.mode)
+    session.task = asyncio.create_task(_drive(session))
+    return session.snapshot()
 
 
-@router.post("/sessions/{session_id}/step")
-async def step_session(session_id: str, user: User = Depends(get_current_user)) -> dict:
-    sess = _own(store.get(session_id), user)
-    await sess.step()
-    return sess.state.model_dump()
+def _session(run_id: str, user_id: str) -> RunSession:
+    session = store.get(run_id, user_id)
+    if session is None:
+        raise HTTPException(404, "Run not found")
+    return session
 
 
-@router.post("/sessions/{session_id}/run")
-async def run_session(session_id: str, user: User = Depends(get_current_user)) -> dict:
-    sess = _own(store.get(session_id), user)
-    asyncio.create_task(sess.run())
-    return {"status": "running"}
+@router.get("/runs/{run_id}")
+async def get_run(run_id: str, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)) -> dict:
+    session = store.get(run_id, user.id)
+    if session is not None:
+        return session.snapshot()
+    record = await db.get(RunRecord, run_id)
+    if record is None or record.user_id != user.id:
+        raise HTTPException(404, "Run not found")
+    return record.trace
 
 
-@router.get("/sessions/{session_id}/score")
-async def score(session_id: str, user: User = Depends(get_current_user)) -> dict:
-    return _own(store.get(session_id), user).state.score.model_dump()
+@router.post("/runs/{run_id}/holds/{hold_id}")
+def decide_hold(run_id: str, hold_id: str, body: HoldBody, user: User = Depends(get_current_user)) -> dict:
+    session = _session(run_id, user.id)
+    if not session.decide(hold_id, body.decision == "approve"):
+        raise HTTPException(409, "That hold is not waiting for a decision")
+    return {"ok": True, "hold_id": hold_id, "decision": body.decision}
 
 
-@router.get("/sessions/{session_id}/stream")
-async def stream(session_id: str, token: str = Query(default=""), db: AsyncSession = Depends(get_db)):
+@router.post("/runs/{run_id}/cancel")
+def cancel_run(run_id: str, user: User = Depends(get_current_user)) -> dict:
+    session = _session(run_id, user.id)
+    session.cancel()
+    return {"ok": True}
+
+
+@router.get("/runs/{run_id}/stream")
+async def stream_run(run_id: str, token: str = Query("")):
     user_id = decode_token(token)
-    sess = store.get(session_id)
-    if not user_id or not sess or sess.user_id != user_id:
-        raise HTTPException(404, "no such session")
-    q = sess.subscribe()
+    if not user_id:
+        raise HTTPException(401, "Not authenticated")
+    session = _session(run_id, user_id)
 
-    async def gen():
-        yield {"event": "snapshot", "data": json.dumps(sess.state.model_dump())}
+    async def events():
+        queue = session.subscribe()
         try:
             while True:
-                msg = await q.get()
-                yield {"event": msg["type"], "data": json.dumps(msg["payload"])}
-        except asyncio.CancelledError:
-            raise
+                event = await queue.get()
+                if event is None:
+                    break
+                yield {"event": event["type"], "id": str(event["seq"]), "data": json.dumps(event)}
         finally:
-            sess.unsubscribe(q)
+            session.unsubscribe(queue)
 
-    return EventSourceResponse(gen())
-
-
-@router.post("/sessions/{session_id}/actions/{action_id}/{decision}")
-async def decide_action(
-    session_id: str, action_id: str, decision: str, user: User = Depends(get_current_user)
-) -> dict:
-    sess = _own(store.get(session_id), user)
-    mapping = {
-        "approve": ActionStatus.approved,
-        "deny": ActionStatus.denied,
-        "execute": ActionStatus.executed,
-    }
-    if decision not in mapping:
-        raise HTTPException(400, "decision must be approve|deny|execute")
-    action = sess.set_action_status(action_id, mapping[decision])
-    if not action:
-        raise HTTPException(404, "no such action")
-    await sess.persist_action_status(action_id, mapping[decision])
-    await sess._emit("action_update", action.model_dump())
-    return action.model_dump()
+    return EventSourceResponse(events(), ping=15)
 
 
 @router.get("/history")
 async def history(user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)) -> list[dict]:
-    result = await db.execute(
-        select(Run).where(Run.user_id == user.id).order_by(Run.created_at.desc()).limit(50)
+    rows = await db.execute(
+        select(RunRecord).where(RunRecord.user_id == user.id).order_by(RunRecord.created_at.desc()).limit(100)
     )
-    runs = result.scalars().all()
     return [
         {
-            "id": r.id,
-            "scenario_id": r.scenario_id,
-            "scenario_name": r.scenario_name,
-            "mode": r.mode,
-            "status": r.status,
-            "turn": r.turn,
-            "max_turns": r.max_turns,
-            "blue_points": r.blue_points,
-            "red_points": r.red_points,
-            "detected": r.detected,
-            "detection_turn": r.detection_turn,
-            "score": r.score,
-            "created_at": r.created_at.isoformat() if r.created_at else None,
-            "finished_at": r.finished_at.isoformat() if r.finished_at else None,
-        }
-        for r in runs
-    ]
-
-
-@router.get("/stats")
-async def stats(user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)) -> dict:
-    result = await db.execute(select(Run).where(Run.user_id == user.id))
-    runs = result.scalars().all()
-    finished = [r for r in runs if r.status == "finished"]
-    detected = [r for r in finished if r.detected]
-    avg_blue = round(sum(r.blue_points for r in finished) / len(finished), 1) if finished else 0
-    detect_turns = [r.detection_turn for r in detected if r.detection_turn]
-    return {
-        "total_runs": len(runs),
-        "finished_runs": len(finished),
-        "detection_rate": round(len(detected) / len(finished), 3) if finished else 0,
-        "avg_blue_points": avg_blue,
-        "avg_detection_turn": round(sum(detect_turns) / len(detect_turns), 2) if detect_turns else None,
-    }
-
-
-class IngestBody(BaseModel):
-    logs: list[dict]
-
-
-@router.post("/ingest")
-async def ingest(body: IngestBody, user: User = Depends(get_current_user)) -> dict:
-    events = []
-    for raw in body.logs:
-        events.append(
-            LogEvent(
-                turn=1,
-                source=str(raw.get("source", "uploaded")),
-                host=raw.get("host"),
-                actor=raw.get("actor"),
-                message=str(raw.get("message", json.dumps(raw))),
-                severity=str(raw.get("severity", "info")),
-            )
-        )
-    inv = await blue_agent.investigate(1, events, NORTHWIND.brief(), get_blue_provider())
-    return {"events": [e.model_dump() for e in events], "investigation": inv.model_dump()}
-
-
-@router.get("/agent/tickets")
-def agent_tickets(user: User = Depends(get_current_user)) -> list[dict]:
-    return list_tickets()
-
-
-class AgentRunBody(BaseModel):
-    ticket_id: Optional[str] = None
-    subject: str = ""
-    body: str = ""
-    defense: bool = True
-
-
-@router.post("/agent/runs")
-async def create_agent_run(body: AgentRunBody, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)) -> dict:
-    blue, _red = await resolve_providers(db, user.id)
-    try:
-        sess = await agent_store.create(user.id, body.defense, blue, body.ticket_id, body.subject, body.body)
-    except KeyError:
-        raise HTTPException(404, "unknown ticket and no body provided")
-    return {"id": sess.id, **sess.state.model_dump()}
-
-
-@router.post("/agent/runs/{run_id}/start")
-async def start_agent_run(run_id: str, user: User = Depends(get_current_user)) -> dict:
-    sess = agent_store.get(run_id)
-    if not sess or sess.user_id != user.id:
-        raise HTTPException(404, "no such run")
-    await sess.run()
-    return sess.state.model_dump()
-
-
-@router.get("/agent/runs/{run_id}")
-async def get_agent_run(run_id: str, user: User = Depends(get_current_user)) -> dict:
-    sess = agent_store.get(run_id)
-    if not sess or sess.user_id != user.id:
-        raise HTTPException(404, "no such run")
-    return sess.state.model_dump()
-
-
-@router.get("/agent/runs/{run_id}/stream")
-async def stream_agent_run(run_id: str, token: str = Query(default="")):
-    user_id = decode_token(token)
-    sess = agent_store.get(run_id)
-    if not user_id or not sess or sess.user_id != user_id:
-        raise HTTPException(404, "no such run")
-    q = sess.subscribe()
-
-    async def gen():
-        yield {"event": "snapshot", "data": json.dumps(sess.state.model_dump())}
-        asyncio.create_task(sess.run())
-        try:
-            while True:
-                msg = await q.get()
-                yield {"event": msg["type"], "data": json.dumps(msg["payload"])}
-                if msg["type"] == "finished":
-                    break
-        except asyncio.CancelledError:
-            raise
-        finally:
-            sess.unsubscribe(q)
-
-    return EventSourceResponse(gen())
-
-
-@router.get("/agent/history")
-async def agent_history(user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)) -> list[dict]:
-    result = await db.execute(
-        select(AgentRun).where(AgentRun.user_id == user.id).order_by(AgentRun.created_at.desc()).limit(50)
-    )
-    rows = result.scalars().all()
-    return [
-        {
-            "id": r.id, "ticket_id": r.ticket_id, "subject": r.subject, "defense": r.defense,
-            "mode": r.mode, "status": r.status, "outcome": r.outcome, "step_count": r.step_count,
-            "blocked_count": r.blocked_count,
+            "id": r.id, "ticket_id": r.ticket_id, "subject": r.subject, "kind": r.kind, "mode": r.mode,
+            "model": r.model, "status": r.status, "outcome": r.outcome, "summary": r.summary,
+            "steps": r.steps, "blocked": r.blocked, "held": r.held,
             "created_at": r.created_at.isoformat() if r.created_at else None,
         }
-        for r in rows
+        for r in rows.scalars()
     ]
-
-
-class RedTeamBody(BaseModel):
-    n: int = 0
-
-
-@router.post("/agent/redteam")
-async def create_redteam(body: RedTeamBody, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)) -> dict:
-    _blue, red = await resolve_providers(db, user.id)
-    c = campaigns.create(user.id, body.n, red)
-    return {"id": c.id}
-
-
-@router.post("/agent/redteam/{cid}/start")
-async def start_redteam(cid: str, user: User = Depends(get_current_user)) -> dict:
-    c = campaigns.get(cid)
-    if not c or c.user_id != user.id:
-        raise HTTPException(404, "no such campaign")
-    await c.run()
-    return c.report or {}
-
-
-@router.get("/agent/redteam/{cid}/stream")
-async def stream_redteam(cid: str, token: str = Query(default="")):
-    user_id = decode_token(token)
-    c = campaigns.get(cid)
-    if not user_id or not c or c.user_id != user_id:
-        raise HTTPException(404, "no such campaign")
-    q = c.subscribe()
-
-    async def gen():
-        asyncio.create_task(c.run())
-        try:
-            while True:
-                msg = await q.get()
-                yield {"event": msg["type"], "data": json.dumps(msg["payload"])}
-                if msg["type"] == "report":
-                    break
-        except asyncio.CancelledError:
-            raise
-        finally:
-            c.unsubscribe(q)
-
-    return EventSourceResponse(gen())
-
-
-class ConnBody(BaseModel):
-    sim_mode: Optional[str] = None
-    blue: Optional[dict] = None
-    red: Optional[dict] = None
-
-
-@router.get("/settings/connection")
-async def get_conn(user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)) -> dict:
-    return mask(await get_connection(db, user.id))
-
-
-@router.put("/settings/connection")
-async def put_conn(body: ConnBody, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)) -> dict:
-    cfg = await upsert_connection(db, user.id, body.model_dump(exclude_none=True))
-    return mask(cfg)
-
-
-@router.post("/settings/connection/test")
-async def test_conn(body: ConnBody, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)) -> dict:
-    stored = await get_connection(db, user.id)
-    data = body.model_dump(exclude_none=True)
-    blue_cfg = {**stored["blue"], **(data.get("blue") or {})}
-    red_cfg = {**stored["red"], **(data.get("red") or {})}
-    for cfg, side in ((blue_cfg, "blue"), (red_cfg, "red")):
-        key = str(cfg.get("api_key") or "")
-        if key in ("", MASK) or "…" in key:
-            cfg["api_key"] = stored[side]["api_key"]
-    return {"blue": await test_side(blue_cfg), "red": await test_side(red_cfg)}

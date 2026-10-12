@@ -18,9 +18,9 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="Riposte — Agentic Red/Blue SOC Simulation",
-    version="0.2.0",
-    description="Charlotte-style defender AI, pressure-tested by an adversary AI, at scale.",
+    title="Riposte",
+    version="0.3.0",
+    description="A provenance-based firewall for AI agent tool calls.",
     lifespan=lifespan,
 )
 
@@ -38,4 +38,4 @@ app.include_router(api_router)
 
 @app.get("/health")
 def health() -> dict:
-    return {"status": "ok", "mode": settings.sim_mode}
+    return {"status": "ok", "model": settings.agent_model}

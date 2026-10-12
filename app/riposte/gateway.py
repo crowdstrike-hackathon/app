@@ -1,0 +1,224 @@
+from __future__ import annotations
+
+from dataclasses import asdict, dataclass, field
+from typing import Any, Optional
+
+from .taint import Secret, Span, destination_key, domain_of
+
+TRUSTED = "trusted"
+UNTRUSTED = "untrusted"
+REQUESTER = "requester"
+UNKNOWN = "unknown"
+
+
+@dataclass(frozen=True)
+class Tool:
+    name: str
+    description: str
+    params: tuple[str, ...]
+    returns: str = TRUSTED
+    destination: Optional[str] = None
+    payload: tuple[str, ...] = ()
+    scope: Optional[str] = None
+    amount: Optional[str] = None
+    confidential: bool = False
+
+    @property
+    def sends(self) -> bool:
+        return self.destination is not None
+
+
+@dataclass
+class Policy:
+    internal_domains: list[str] = field(default_factory=lambda: ["northwind.io"])
+    refund_limit: float = 200.0
+    enforce_scope: bool = True
+    hold_unverified: bool = True
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+@dataclass
+class Evidence:
+    arg: str
+    value: str
+    source: str
+    origins: list[str] = field(default_factory=list)
+
+
+@dataclass
+class Decision:
+    action: str = "allow"
+    rule: str = ""
+    title: str = ""
+    reason: str = ""
+    evidence: list[Evidence] = field(default_factory=list)
+
+    @property
+    def allowed(self) -> bool:
+        return self.action == "allow"
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+class Gateway:
+    def __init__(self, policy: Optional[Policy] = None) -> None:
+        self.policy = policy or Policy()
+        self.spans: list[Span] = []
+        self.secrets: list[Secret] = []
+        self.read_owners: dict[str, Secret] = {}
+        self.requester: Optional[str] = None
+        self.scope: Optional[str] = None
+        self.step = 0
+
+    def trust(self, text: str, origin: str) -> None:
+        self.spans.append(Span(text, TRUSTED, origin, self.step))
+
+    def observe(self, text: str, label: str, origin: str) -> None:
+        self.spans.append(Span(text, label, origin, self.step))
+
+    def set_requester(self, address: str, scope: Optional[str]) -> None:
+        if self.requester is None:
+            self.requester = destination_key(address)
+        if self.scope is None and scope:
+            self.scope = scope
+
+    def register_secret(self, secret: Secret) -> None:
+        self.secrets.append(secret)
+        self.read_owners[secret.owner_id] = secret
+
+    def trace(self, value: Any) -> tuple[str, list[str]]:
+        text = str(value)
+        hits: dict[str, list[str]] = {TRUSTED: [], UNTRUSTED: [], REQUESTER: []}
+        for span in self.spans:
+            if span.contains(text) and span.origin not in hits[span.label]:
+                hits[span.label].append(span.origin)
+        if hits[TRUSTED]:
+            return TRUSTED, hits[TRUSTED]
+        if hits[UNTRUSTED]:
+            return UNTRUSTED, hits[UNTRUSTED]
+        if hits[REQUESTER]:
+            return REQUESTER, hits[REQUESTER]
+        return UNKNOWN, []
+
+    def annotate(self, tool: Tool, args: dict) -> list[Evidence]:
+        out = []
+        for name in tool.params:
+            if name not in args or args[name] in ("", None):
+                continue
+            value = str(args[name])
+            probe = destination_key(value) if name == tool.destination else value
+            source, origins = self.trace(probe) if len(value) <= 200 else (UNKNOWN, [])
+            out.append(Evidence(name, value[:240], source, origins))
+        return out
+
+    def _secrets_in(self, text: str) -> list[tuple[Secret, str]]:
+        found = []
+        for secret in self.secrets:
+            how = secret.found_in(text)
+            if how:
+                found.append((secret, how))
+        return found
+
+    def _is_internal(self, dest: str) -> bool:
+        dom = domain_of(dest)
+        return any(dom == d or dom.endswith("." + d) for d in self.policy.internal_domains)
+
+    def check(self, tool: Tool, args: dict) -> Decision:
+        evidence = self.annotate(tool, args)
+
+        if tool.scope and self.policy.enforce_scope and self.scope:
+            asked = str(args.get(tool.scope, "")).strip().upper()
+            if tool.confidential and asked and asked != self.scope.upper():
+                return Decision(
+                    "block", "scope", "Outside this ticket's customer",
+                    f"This ticket belongs to {self.scope}. {tool.name} was called for {asked}, "
+                    f"so it would read another customer's confidential data.",
+                    evidence,
+                )
+
+        if tool.amount and tool.scope and self.policy.enforce_scope and self.scope:
+            asked = str(args.get(tool.scope, "")).strip().upper()
+            if asked and asked != self.scope.upper():
+                return Decision(
+                    "hold", "scope", "Money moving to a different customer",
+                    f"This ticket belongs to {self.scope}, but {tool.name} targets {asked}. "
+                    f"A person needs to approve it.",
+                    evidence,
+                )
+
+        if tool.amount:
+            try:
+                amount = float(str(args.get(tool.amount, 0)).replace("$", "").replace(",", ""))
+            except ValueError:
+                amount = 0.0
+            if amount > self.policy.refund_limit:
+                return Decision(
+                    "hold", "limit", "Amount above the approval limit",
+                    f"{tool.name} for ${amount:,.2f} is above the ${self.policy.refund_limit:,.0f} limit "
+                    f"and needs a person to approve it.",
+                    evidence,
+                )
+
+        if not tool.sends:
+            return Decision(evidence=evidence)
+
+        raw_dest = str(args.get(tool.destination, ""))
+        dest = destination_key(raw_dest)
+        source, origins = self.trace(dest)
+        verified = source == TRUSTED or self._is_internal(dest)
+        is_requester = dest == self.requester
+        where = f"it appears only in {origins[0]}" if source == UNTRUSTED else "it does not appear in any trusted source"
+
+        payload = " ".join(str(args.get(p, "")) for p in tool.payload)
+        for secret, how in self._secrets_in(payload):
+            if dest not in secret.allowed and not self._is_internal(dest):
+                return Decision(
+                    "block", "confidential", f"{secret.owner_name}'s {secret.name} would leave to the wrong place",
+                    f"The message contains {secret.owner_name}'s {secret.name} ({how}). It may only be sent to "
+                    f"{', '.join(secret.allowed)}. The destination is {dest}; {where}.",
+                    evidence,
+                )
+
+        if not verified and not is_requester:
+            if self.read_owners:
+                names = ", ".join(s.owner_name for s in self.read_owners.values())
+                return Decision(
+                    "block", "destination", "Unverified destination after reading confidential data",
+                    f"{tool.name} targets {dest}; {where}. The agent has already read confidential data "
+                    f"for {names}, so nothing may be sent there.",
+                    evidence,
+                )
+            if self.policy.hold_unverified:
+                return Decision(
+                    "hold", "destination", "Destination was not given by a trusted source",
+                    f"{tool.name} targets {dest}; {where}. A person needs to approve it.",
+                    evidence,
+                )
+
+        if self.read_owners and not self._is_internal(dest):
+            allowed = {a for s in self.read_owners.values() for a in s.allowed}
+            if dest not in allowed:
+                names = ", ".join(s.owner_name for s in self.read_owners.values())
+                return Decision(
+                    "hold", "confidential", "Sending outside the data owner",
+                    f"The agent has read confidential data for {names} and is now sending to {dest}, "
+                    f"which is not the owner's address on file.",
+                    evidence,
+                )
+
+        return Decision(evidence=evidence)
+
+    def check_reply(self, text: str) -> Decision:
+        dest = self.requester or ""
+        for secret, how in self._secrets_in(text):
+            if dest not in secret.allowed:
+                return Decision(
+                    "block", "confidential", f"Reply would reveal {secret.owner_name}'s {secret.name}",
+                    f"The reply contains {secret.owner_name}'s {secret.name} ({how}) and goes to "
+                    f"{dest or 'the requester'}, which is not {', '.join(secret.allowed)}.",
+                    [Evidence("message", text[:240], TRUSTED, [])],
+                )
+        return Decision()
