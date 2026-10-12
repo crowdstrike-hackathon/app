@@ -264,6 +264,7 @@ class Chat:
             gateway.trust(result.text, "the help center")
         elif name == "get_customer" and result.customer:
             gateway.trust(result.text, f"the customer record for {result.customer['name']}")
+            gateway.register_record(self.world.record_for(result.customer))
         elif name == "get_api_key" and result.secret:
             gateway.register_secret(result.secret)
             gateway.trust(result.text, "the key vault")

@@ -159,3 +159,21 @@ class Secret:
                 if any(piece in s for s in squashed):
                     return "partial"
         return None
+
+
+@dataclass
+class Record:
+    """Personal details from one customer's record. Only that customer may receive them."""
+    owner_id: str
+    owner_name: str
+    fields: tuple[tuple[str, str], ...]
+    allowed: tuple[str, ...]
+
+    def found_in(self, payload: str) -> list[str]:
+        squashed = [squash(v) for v in views(payload)]
+        hits = []
+        for label, value in self.fields:
+            target = squash(value)
+            if len(target) >= 4 and any(target in s for s in squashed):
+                hits.append(label)
+        return hits
