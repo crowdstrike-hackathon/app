@@ -15,6 +15,13 @@ class Settings(BaseSettings):
     agent_model: str = "llama3.2:3b"
     agent_api_key: str = "ollama"
     agent_max_steps: int = 10
+
+    redteam_base_url: str = "http://localhost:11435/v1"
+    redteam_model: str = "redteam-clean:latest"
+    redteam_api_key: str = "ollama"
+    redteam_rounds: int = 6
+    redteam_disable_thinking: bool = True
+    redteam_transport: str = "ollama_raw"
     agent_timeout_seconds: float = 90.0
 
     tickets_path: str = "tickets.json"

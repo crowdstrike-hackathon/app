@@ -66,6 +66,11 @@ AGENT_MODEL=gpt-4.1-mini
 Tickets are loaded from `tickets.json` in this directory on every request, so edits show up without
 a restart. If that file does not exist, `tickets.sample.json` is used.
 
+Runtime tickets can also be added with authenticated `POST /api/tickets`, using
+`{"from":"dana@acmerobotics.com","subject":"...","body":"..."}`. The desk generates
+an ID and matches the sender to one of the three sandbox accounts. Runtime tickets
+are private to the signed-in user and remain available until the backend restarts.
+
 ```json
 {
   "tickets": [
@@ -95,6 +100,11 @@ All routes except `/api/meta` and `/api/auth/*` need a bearer token.
 | `POST /api/auth/register`, `POST /api/auth/login` | Get a token |
 | `GET /api/meta` | Model status, modes, policy, tools |
 | `GET /api/tickets` | Tickets from `tickets.json` |
+| `POST /api/tickets` | Add a runtime sandbox ticket |
+| `GET /api/settings/redteam`, `PUT /api/settings/redteam` | Inspect or configure the attacker endpoint |
+| `POST /api/redteam` | Start rounds: `{"rounds":6,"goal":"cycle"}` |
+| `GET /api/redteam/{id}` | Running rounds, traces, audit evidence, and tally |
+| `POST /api/redteam/{id}/cancel` | Stop a tournament |
 | `GET /api/world` | Customers, help-center articles, policy |
 | `POST /api/chats` | Start a conversation with its first message. Body: `{"mode": "riposte", "message": "Handle @TK-2001"}` |
 | `POST /api/chats/{id}/messages` | Send the next message. Body: `{"message": "..."}` |
@@ -103,3 +113,46 @@ All routes except `/api/meta` and `/api/auth/*` need a bearer token.
 | `POST /api/chats/{id}/holds/{hold_id}` | Body `{"decision": "approve"}` or `{"decision": "deny"}` |
 | `POST /api/chats/{id}/cancel` | Stop the turn in progress |
 | `GET /api/history` | Past conversations |
+
+## Attacker arena
+
+Open `/redteam` in the frontend, or follow **Attacker arena** from the console.
+The attacker's one-block system prompt is `app/agent/attacker_prompt.txt`.
+Goals are `external_key`, `cross_customer_key`, `refund_over_limit`, or `cycle`.
+Each round creates a runtime ticket, runs fresh Nova chats in `off` and `riposte`
+with identical fake customer data, audits their effects, and feeds both replies
+and audit results back to the attacker before requesting another ticket. Riposte
+holds are automatically denied. Model errors are displayed separately from scored
+runs. Tournaments and runtime inbox additions are held in memory for this demo.
+Attacker settings changed in the UI last until restart; `.env` sets startup values.
+
+The supplied GPU host serves Ollama on remote loopback port 11434. The original
+SSH key was rejected; the existing `id_ed25519_gpu` key works:
+
+```bash
+ssh -N -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 \
+  -L 127.0.0.1:11435:127.0.0.1:11434 \
+  -p <pod-port> -i ~/.ssh/<your-key> root@<pod-ip>
+```
+
+From this backend directory, create the clean model alias (preserves `redteam:latest`):
+
+```bash
+.venv/bin/python scripts/fix_redteam_template.py
+```
+
+Use `REDTEAM_BASE_URL=http://localhost:11435/v1`,
+`REDTEAM_MODEL=redteam-clean:latest`, and `REDTEAM_TRANSPORT=ollama_raw` (defaults).
+Imported GGUF Jinja can override the Modelfile chat template, so the Ollama client
+renders the text-only ChatML template explicitly with actual newlines, role
+boundaries, and a closed thinking prefix. It calls `/api/generate` in raw mode with
+a strict three-field JSON schema. This avoids reasoning or template text entering
+the inbox. For other OpenAI-compatible providers set `REDTEAM_TRANSPORT=openai`;
+these receive JSON mode, disabled-thinking options, and strict JSON validation.
+
+Verification:
+
+```bash
+.venv/bin/python -m unittest discover -s tests -v
+.venv/bin/python -m scripts.check_redteam  # two live rounds using configured models
+```

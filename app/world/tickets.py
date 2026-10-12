@@ -1,9 +1,25 @@
 from __future__ import annotations
 
 import json
+from uuid import uuid4
 from pathlib import Path
 
 from ..config import settings
+from .seed import CUSTOMERS
+from ..riposte.taint import destination_key
+
+_runtime: dict[str, list[dict]] = {}
+
+
+def add_ticket(raw: dict, user_id: str) -> dict:
+    sender = destination_key(raw.get("from", ""))
+    customer = next((c for c in CUSTOMERS if c["email"] == sender), None)
+    if customer is None:
+        raise ValueError("Sender must be one of the three sandbox customers")
+    ticket = normalize_ticket({**raw, "id": "TK-" + uuid4().hex[:12].upper(),
+                               "customer_id": customer["id"]})
+    _runtime.setdefault(user_id, []).append(ticket)
+    return ticket
 
 FIELDS = ("id", "from", "subject", "body")
 
@@ -33,7 +49,7 @@ def normalize_ticket(raw: dict, index: int = 0) -> dict:
     return ticket
 
 
-def load_tickets() -> tuple[list[dict], dict]:
+def _load_file_tickets() -> tuple[list[dict], dict]:
     path = tickets_file()
     if path is None:
         return [], {"path": settings.tickets_path, "found": False, "errors": []}
@@ -58,3 +74,9 @@ def load_tickets() -> tuple[list[dict], dict]:
         seen.add(ticket["id"])
         tickets.append(ticket)
     return tickets, info
+
+
+def load_tickets(user_id: str = "") -> tuple[list[dict], dict]:
+    tickets, info = _load_file_tickets()
+    runtime = _runtime.get(user_id, [])
+    return tickets + list(runtime), {**info, "runtime_count": len(runtime)}

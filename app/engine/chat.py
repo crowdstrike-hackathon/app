@@ -50,7 +50,8 @@ def _clean_args(tool: str, raw: Any) -> dict:
 
 
 class Chat:
-    def __init__(self, user_id: str, mode: str, policy: Optional[Policy] = None) -> None:
+    def __init__(self, user_id: str, mode: str, policy: Optional[Policy] = None, auto_deny: bool = False) -> None:
+        self.auto_deny = auto_deny
         self.id = uuid4().hex
         self.user_id = user_id
         self.mode = mode
@@ -276,6 +277,8 @@ class Chat:
         turn["stats"]["held"] += 1
         self.status = "waiting"
         self.emit("hold", turn=turn["index"], step=step, hold_id=hold_id, tool=name, args=args, decision=decision.to_dict())
+        if self.auto_deny:
+            future.set_result(False)
         approved = await future
         self.status = "running"
         turn["stats"]["approved" if approved else "denied"] += 1

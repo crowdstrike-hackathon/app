@@ -234,6 +234,7 @@ class World:
                 incidents.append({
                     "kind": "refund", "channel": "issue_refund", "customer": refund["customer"], "to": refund["customer"],
                     "approved": refund["approved"],
+                    "over_limit": over, "amount": refund["amount"],
                     "summary": f"${refund['amount']:,.2f} was refunded to {refund['customer']}, {why}.",
                 })
         return incidents

@@ -46,19 +46,23 @@ def extract_json(text: str) -> dict:
     raise LLMError("unbalanced JSON in model reply")
 
 
-async def chat_json(messages: list[dict], *, temperature: float = 0.0) -> dict:
+async def chat_json(
+    messages: list[dict], *, temperature: float = 0.0, base_url: str = "", model: str = "", api_key: str = "",
+    extra: dict | None = None, strict: bool = False,
+) -> dict:
+    base = (base_url or settings.agent_base_url).rstrip("/")
     payload = {
-        "model": settings.agent_model,
+        "model": model or settings.agent_model,
         "messages": messages,
         "temperature": temperature,
-        "seed": 7,
         "response_format": {"type": "json_object"},
+        **(extra or {"seed": 7}),
     }
     try:
         async with httpx.AsyncClient(timeout=settings.agent_timeout_seconds) as client:
             resp = await client.post(
-                f"{settings.agent_base_url.rstrip('/')}/chat/completions",
-                headers={"Authorization": f"Bearer {settings.agent_api_key}"},
+                f"{base}/chat/completions",
+                headers={"Authorization": f"Bearer {api_key or settings.agent_api_key}"},
                 json=payload,
             )
             resp.raise_for_status()
@@ -66,22 +70,31 @@ async def chat_json(messages: list[dict], *, temperature: float = 0.0) -> dict:
     except httpx.HTTPStatusError as exc:
         raise LLMError(f"model endpoint returned {exc.response.status_code}: {exc.response.text[:200]}") from exc
     except httpx.HTTPError as exc:
-        raise LLMError(f"cannot reach the model at {settings.agent_base_url} ({type(exc).__name__})") from exc
+        raise LLMError(f"cannot reach the model at {base} ({type(exc).__name__})") from exc
     except (KeyError, IndexError, ValueError) as exc:
         raise LLMError("unexpected response shape from the model endpoint") from exc
+    if strict:
+        try:
+            value = json.loads(text or "")
+        except (ValueError, TypeError) as exc:
+            raise LLMError("Attacker must return only a JSON object, without reasoning or fences") from exc
+        if not isinstance(value, dict):
+            raise LLMError("Attacker reply must be a JSON object")
+        return value
     return extract_json(text or "")
 
 
-async def model_status() -> dict:
-    base = settings.agent_base_url.rstrip("/")
-    status = {"model": settings.agent_model, "base_url": base, "reachable": False, "available": False}
+async def model_status(base_url: str = "", model: str = "", api_key: str = "") -> dict:
+    base = (base_url or settings.agent_base_url).rstrip("/")
+    model = model or settings.agent_model
+    status = {"model": model, "base_url": base, "reachable": False, "available": False}
     try:
         async with httpx.AsyncClient(timeout=3.0) as client:
-            resp = await client.get(f"{base}/models", headers={"Authorization": f"Bearer {settings.agent_api_key}"})
+            resp = await client.get(f"{base}/models", headers={"Authorization": f"Bearer {api_key or settings.agent_api_key}"})
             resp.raise_for_status()
             names = [m.get("id", "") for m in resp.json().get("data", [])]
     except (httpx.HTTPError, ValueError):
         return status
     status["reachable"] = True
-    status["available"] = settings.agent_model in names
+    status["available"] = model in names
     return status
