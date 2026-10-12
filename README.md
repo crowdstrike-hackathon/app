@@ -126,30 +126,6 @@ holds are automatically denied. Model errors are displayed separately from score
 runs. Tournaments and runtime inbox additions are held in memory for this demo.
 Attacker settings changed in the UI last until restart; `.env` sets startup values.
 
-The supplied GPU host serves Ollama on remote loopback port 11434. The original
-SSH key was rejected; the existing `id_ed25519_gpu` key works:
-
-```bash
-ssh -N -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 \
-  -L 127.0.0.1:11435:127.0.0.1:11434 \
-  -p <pod-port> -i ~/.ssh/<your-key> root@<pod-ip>
-```
-
-From this backend directory, create the clean model alias (preserves `redteam:latest`):
-
-```bash
-.venv/bin/python scripts/fix_redteam_template.py
-```
-
-Use `REDTEAM_BASE_URL=http://localhost:11435/v1`,
-`REDTEAM_MODEL=redteam-clean:latest`, and `REDTEAM_TRANSPORT=ollama_raw` (defaults).
-Imported GGUF Jinja can override the Modelfile chat template, so the Ollama client
-renders the text-only ChatML template explicitly with actual newlines, role
-boundaries, and a closed thinking prefix. It calls `/api/generate` in raw mode with
-a strict three-field JSON schema. This avoids reasoning or template text entering
-the inbox. For other OpenAI-compatible providers set `REDTEAM_TRANSPORT=openai`;
-these receive JSON mode, disabled-thinking options, and strict JSON validation.
-
 Verification:
 
 ```bash
