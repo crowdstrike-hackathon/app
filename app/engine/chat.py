@@ -82,6 +82,8 @@ class Chat:
         self.policy = policy or Policy()
         self.world = World(tickets={}, internal_domains=list(self.policy.internal_domains), refund_limit=self.policy.refund_limit)
         self.gateway = Gateway(self.policy) if mode == "riposte" else None
+        # Records where information came from in every mode, for the flow map. Only self.gateway enforces.
+        self.tracer = self.gateway or Gateway(self.policy)
         self.filter = KeywordFilter() if mode == "keyword" else None
         self.messages: list[dict] = [{"role": "system", "content": system_prompt()}]
         self.status = "idle"
@@ -234,9 +236,8 @@ class Chat:
         refs = self._refs(message)
         if refs:
             self.world.requester = ""
-            if self.gateway:
-                self.gateway.requester = None
-                self.gateway.scope = None
+            self.tracer.requester = None
+            self.tracer.scope = None
         if not self.title:
             self.title = message[:300]
         turn = {
@@ -397,7 +398,7 @@ class Chat:
         return outgoing(name, _clean_args(name, action.get("args") or action.get("arguments") or {}))
 
     def _observe(self, name: str, result, args: Optional[dict] = None, approved: bool = False) -> None:
-        gateway = self.gateway
+        gateway = self.tracer
         if gateway is None or not result.ok:
             return
         if name == "issue_refund" and args is not None and not approved:
@@ -462,14 +463,13 @@ class Chat:
         prompt = operator_prompt(turn["message"], turn["refs"], turn["intent"])
         if self.gateway:
             self.gateway.authorized = turn["intent"] == "task"
-            self.gateway.trust(prompt, "the operator's message")
+        self.tracer.trust(prompt, "the operator's message")
         self.messages.append({"role": "user", "content": prompt})
         for _ in range(settings.agent_max_steps):
             self._step += 1
             step = self._step
             stats["steps"] += 1
-            if self.gateway:
-                self.gateway.step = step
+            self.tracer.step = step
             self.emit("thinking", turn=index, step=step)
             action = await self._next_action(turn)
             if action is None:
@@ -498,6 +498,7 @@ class Chat:
             self.emit(
                 "call", turn=index, step=step, tool=name, args=args, thought=action["thought"],
                 decision=decision.to_dict(), checked=self.gateway is not None,
+                **self.tracer.flows(TOOLS[name], args, decision.rule),
             )
 
             approved = False
