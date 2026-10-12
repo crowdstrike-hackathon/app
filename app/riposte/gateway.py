@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 from typing import Any, Optional
 
-from .taint import Secret, Span, destination_key, domain_of
+from .taint import Record, Secret, Span, destination_key, domain_of
 
 TRUSTED = "trusted"
 UNTRUSTED = "untrusted"
@@ -74,6 +74,7 @@ class Gateway:
         self.authorized = True
         self.step = 0
         self.refunded: dict[str, float] = {}
+        self.records: dict[str, Record] = {}
 
     def trust(self, text: str, origin: str) -> None:
         self.spans.append(Span(text, TRUSTED, origin, self.step))
@@ -97,6 +98,24 @@ class Gateway:
     def record_refund(self, customer_id: str, amount: float) -> None:
         key = str(customer_id).strip().upper()
         self.refunded[key] = self.refunded.get(key, 0.0) + amount
+
+    def register_record(self, record: Record) -> None:
+        self.records[record.owner_id] = record
+
+    def _record_leak(self, text: str, dest: str, channel: str, evidence: list[Evidence]) -> Optional[Decision]:
+        for record in self.records.values():
+            if dest in record.allowed or self._is_internal(dest):
+                continue
+            hits = record.found_in(text)
+            if hits:
+                return Decision(
+                    "block", "record", f"{record.owner_name}'s customer details would leave to the wrong person",
+                    f"The {channel} contains {record.owner_name}'s {', '.join(hits)} from their customer record. "
+                    f"Those details may only go to {', '.join(record.allowed)}, and this goes to "
+                    f"{dest or 'an unknown sender'}.",
+                    evidence,
+                )
+        return None
 
     def register_secret(self, secret: Secret) -> None:
         self.secrets.append(secret)
@@ -215,6 +234,10 @@ class Gateway:
                     evidence,
                 )
 
+        leak = self._record_leak(payload, dest, "message", evidence)
+        if leak:
+            return leak
+
         if not verified and not is_requester:
             if self.read_owners:
                 names = ", ".join(s.owner_name for s in self.read_owners.values())
@@ -256,4 +279,7 @@ class Gateway:
                     f"{dest or 'the requester'}, which is not {', '.join(secret.allowed)}.",
                     [Evidence("message", text[:240], TRUSTED, [])],
                 )
+        leak = self._record_leak(text, dest, "reply", [Evidence("message", text[:240], UNKNOWN, [])])
+        if leak:
+            return leak
         return Decision()
