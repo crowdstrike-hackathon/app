@@ -12,7 +12,7 @@ from ..world.world import TOOLS
 if TYPE_CHECKING:
     from .chat import Chat
 
-RISKY = ("get_api_key", "issue_refund", "send_email", "reply")
+RISKY = ("get_api_key", "issue_refund", "send_email")
 LIMIT = 500
 
 SYSTEM = (
