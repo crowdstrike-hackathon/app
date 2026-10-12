@@ -15,7 +15,7 @@ call: where did this argument come from, and is this action allowed to be driven
 | `app/riposte/gateway.py` | The firewall. Labels what the agent reads (trusted, untrusted, requester) and returns allow, hold or block for each tool call, with evidence |
 | `app/riposte/baseline.py` | The keyword filter used as the comparison baseline |
 | `app/world/` | The sandbox: three customers with API keys, a help center, and the tools `read_ticket`, `search_kb`, `get_customer`, `get_api_key`, `issue_refund`, `send_email`, `reply` |
-| `app/agent/` | The agent prompt and the client for the local model |
+| `app/agent/` | The agent prompt and the client for the model endpoint |
 | `app/engine/runs.py` | The agent loop. One JSON action per turn, every call goes through the gateway, held calls wait for a person |
 | `app/api/routes.py` | FastAPI routes and the server-sent event stream |
 
@@ -48,6 +48,15 @@ uvicorn app.main:app --port 8000
 ```
 
 Settings are read from `.env` (see `.env.example`). The default database is a local SQLite file.
+
+The agent talks to any OpenAI-compatible chat endpoint. The default is a local Ollama model. To use a
+hosted model instead, set these in `.env` (which is not committed):
+
+```
+AGENT_BASE_URL=https://api.openai.com/v1
+AGENT_API_KEY=sk-...
+AGENT_MODEL=gpt-4.1-mini
+```
 
 ## Tickets
 
