@@ -16,6 +16,7 @@ class Settings(BaseSettings):
     agent_api_key: str = "ollama"
     agent_max_steps: int = 10
     agent_reasoning_effort: str = "none"
+    reviewer_enabled: bool = True
 
     agent_timeout_seconds: float = 90.0
     inbound_per_sender_per_minute: int = 12

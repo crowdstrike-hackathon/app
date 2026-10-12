@@ -6,6 +6,10 @@ from app.engine.chat import Chat
 from app.riposte.cause import same_action, sentence_spans, without
 from tests.test_twin import load
 
+from app.config import settings as _settings
+
+_settings.reviewer_enabled = False
+
 ADDRESS = re.compile(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+")
 
 

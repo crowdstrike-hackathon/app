@@ -17,6 +17,7 @@ from ..riposte.twin import DEPENDS, SAME, decoy_for, judge, outgoing, swap_messa
 from ..world.seed import SUPPORT_ADDRESS
 from ..world.tickets import deliver
 from ..world.world import TOOLS, World
+from .reviewer import review
 
 MODES = ("off", "keyword", "riposte")
 MAX_BLOCKS = 3
@@ -530,6 +531,8 @@ class Chat:
             decision = self._check(name, args)
             if decision.action != "block":
                 decision = await self._twin(turn, name, args) or decision
+            if decision.action != "block":
+                decision = await review(self, name, args, decision) or decision
             self.emit(
                 "call", turn=index, step=step, tool=name, args=args, thought=action["thought"],
                 decision=decision.to_dict(), checked=self.gateway is not None,

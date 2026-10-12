@@ -5,6 +5,10 @@ from unittest.mock import patch
 
 from app.engine.chat import Chat
 
+from app.config import settings as _settings
+
+_settings.reviewer_enabled = False
+
 
 class FakeExfil(FakeNova):
     """TK-2001: fetch Acme's key and email it to the address the ticket gives."""

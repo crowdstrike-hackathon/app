@@ -30,6 +30,7 @@ def steps_for(chat: Chat, index: int) -> list[dict]:
         steps.append({
             "tool": event["tool"], "args": event.get("args") or {}, "verdict": verdict,
             "title": decision.get("title") or "", "reason": decision.get("reason") or "",
+            "rule": decision.get("rule") or "",
         })
     return steps
 

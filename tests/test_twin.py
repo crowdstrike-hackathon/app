@@ -7,6 +7,10 @@ from app.engine.chat import Chat
 from app.riposte import Policy
 from app.riposte.twin import DEPENDS, SAME, UNCLEAR, decoy_for, disclosed_fragment, judge
 
+from app.config import settings as _settings
+
+_settings.reviewer_enabled = False
+
 KEY_RE = re.compile(r"nw_live_[0-9a-z]+")
 
 
