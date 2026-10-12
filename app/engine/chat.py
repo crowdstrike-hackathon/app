@@ -12,6 +12,7 @@ from ..agent.prompt import intent_messages, operator_prompt, reply_nudge, result
 from ..config import settings
 from ..riposte import REQUESTER, UNTRUSTED, Decision, Gateway, KeywordFilter, Policy
 from ..riposte.taint import destination_key
+from ..riposte.cause import same_action, sentence_spans, without
 from ..riposte.twin import DEPENDS, SAME, decoy_for, judge, outgoing, swap_messages
 from ..world.seed import SUPPORT_ADDRESS
 from ..world.tickets import deliver
@@ -253,7 +254,7 @@ class Chat:
 
     async def run_turn(self, turn: dict) -> None:
         marks = self.world.marks()
-        state = {"scope": None, "quarantined": False, "replied": False, "nudged": False}
+        state = {"scope": None, "quarantined": False, "replied": False, "nudged": False, "ticket": None, "explained": set()}
         try:
             await self._loop(turn, state)
             turn["status"] = "done"
@@ -390,6 +391,39 @@ class Chat:
             f"A person needs to approve sending this to {who}.",
         )
 
+    async def _find_cause(self, turn: dict, step: int, name: str, args: dict, history: list[dict], ticket: dict) -> None:
+        """Re-run the flagged step without each sentence of the email to find the one that caused it."""
+        body = str(ticket.get("body", ""))
+        spans = sentence_spans(body)
+        if not spans:
+            return
+        index = turn["index"]
+        marker = "Result of read_ticket"
+        self.emit("note", turn=index, level="info", text=(
+            f"Cause finder: asking the agent again {len(spans)} times, each time with one sentence of the "
+            f"email removed, to find which sentence made it call {name}."
+        ))
+
+        def taken(action: dict) -> bool:
+            other = str(action.get("tool") or action.get("action") or "").strip()
+            other_args = _clean_args(other, action.get("args") or action.get("arguments") or {}) if other in TOOLS else {}
+            return same_action(name, args, other, other_args)
+
+        try:
+            if not taken(await chat_json(history)):
+                self.emit("cause", turn=index, step=step, tool=name, ticket=ticket.get("id"), body=body,
+                          guilty=[], tested=0, stable=False)
+                return
+            guilty = []
+            for start, end in spans:
+                if not taken(await chat_json(without(history, marker, body[start:end]))):
+                    guilty.append([start, end])
+        except LLMError as exc:
+            self.emit("note", turn=index, level="warn", text=f"Cause finder could not finish: {exc}")
+            return
+        self.emit("cause", turn=index, step=step, tool=name, ticket=ticket.get("id"), body=body,
+                  guilty=guilty, tested=len(spans), stable=True)
+
     @staticmethod
     def _as_outgoing(action: dict) -> str:
         name = str(action.get("tool") or action.get("action") or "").strip()
@@ -476,6 +510,7 @@ class Chat:
                 self.emit("note", turn=index, level="warn", text="The model could not produce a valid action.")
                 return
             name, args = action["tool"], action["args"]
+            history = list(self.messages[:-1])
 
             if name == "answer":
                 message = str(args.get("message", "")).strip()
@@ -500,6 +535,9 @@ class Chat:
                 decision=decision.to_dict(), checked=self.gateway is not None,
                 **self.tracer.flows(TOOLS[name], args, decision.rule),
             )
+            if decision.action in ("block", "hold") and self.gateway and state["ticket"] and name not in state["explained"]:
+                state["explained"].add(name)
+                await self._find_cause(turn, step, name, args, history, state["ticket"])
 
             approved = False
             if decision.action == "block":
@@ -544,6 +582,7 @@ class Chat:
 
             if name == "read_ticket" and result.ok:
                 state["scope"] = result.ticket.get("customer_id")
+                state["ticket"] = result.ticket
                 if self.filter:
                     hits = self.filter.scan(result.text)
                     self.emit("filter", turn=index, step=step, hits=hits)
