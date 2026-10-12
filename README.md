@@ -14,9 +14,9 @@ call: where did this argument come from, and is this action allowed to be driven
 | `app/riposte/taint.py` | Normalises text, sees through base64, hex, URL encoding, rot13, reversal and homoglyphs, and finds secrets in outgoing text |
 | `app/riposte/gateway.py` | The firewall. Labels what the agent reads (trusted, untrusted, requester) and returns allow, hold or block for each tool call, with evidence |
 | `app/riposte/baseline.py` | The keyword filter used as the comparison baseline |
-| `app/world/` | The sandbox: three customers with API keys, a help center, and the tools `read_ticket`, `search_kb`, `get_customer`, `get_api_key`, `issue_refund`, `send_email`, `reply` |
+| `app/world/` | The sandbox: three customers with API keys, a help center, and the tools `read_ticket`, `search_kb`, `get_customer`, `get_api_key`, `issue_refund`, `send_email`, `reply`, `answer` |
 | `app/agent/` | The agent prompt and the client for the model endpoint |
-| `app/engine/runs.py` | The agent loop. One JSON action per turn, every call goes through the gateway, held calls wait for a person |
+| `app/engine/chat.py` | The conversation loop. An operator chats with the agent and points it at tickets or customers with `@` references. One JSON action per step, every call goes through the gateway, held calls wait for a person |
 | `app/api/routes.py` | FastAPI routes and the server-sent event stream |
 
 ## The rules the gateway enforces
@@ -29,11 +29,13 @@ call: where did this argument come from, and is this action allowed to be driven
 
 ## Modes
 
+The operator's own messages are trusted. The contents of a ticket the agent reads are not.
+
 - `off`: every tool call runs.
-- `keyword`: the ticket text is scanned for known injection phrases. A match quarantines the ticket; otherwise nothing else is checked.
+- `keyword`: each ticket the agent reads is scanned for known injection phrases. A match quarantines the ticket; otherwise nothing else is checked.
 - `riposte`: every tool call goes through the gateway.
 
-After each run the sandbox is audited independently of the gateway, so the outcome (`compromised`,
+After each turn the sandbox is audited independently of the gateway, so the outcome (`compromised`,
 `blocked`, `reviewed`, `quarantined`, `clean`) reflects what actually left the sandbox.
 
 ## Run
@@ -93,9 +95,10 @@ All routes except `/api/meta` and `/api/auth/*` need a bearer token.
 | `GET /api/meta` | Model status, modes, policy, tools |
 | `GET /api/tickets` | Tickets from `tickets.json` |
 | `GET /api/world` | Customers, help-center articles, policy |
-| `POST /api/runs` | Start a run. Body: `{"mode": "riposte", "ticket_id": "TK-1001"}` or `{"mode": "off", "ticket": {"from": "...", "subject": "...", "body": "...", "customer_id": null}}` |
-| `GET /api/runs/{id}` | Snapshot of a run with all its events |
-| `GET /api/runs/{id}/stream?token=` | Server-sent events: `start`, `thinking`, `call`, `result`, `hold`, `hold_resolved`, `filter`, `note`, `error`, `done` |
-| `POST /api/runs/{id}/holds/{hold_id}` | Body `{"decision": "approve"}` or `{"decision": "deny"}` |
-| `POST /api/runs/{id}/cancel` | Stop a run |
-| `GET /api/history` | Past runs |
+| `POST /api/chats` | Start a conversation with its first message. Body: `{"mode": "riposte", "message": "Handle @TK-2001"}` |
+| `POST /api/chats/{id}/messages` | Send the next message. Body: `{"message": "..."}` |
+| `GET /api/chats/{id}` | Snapshot of a conversation with all its events |
+| `GET /api/chats/{id}/stream?token=&after=` | Server-sent events for the turn in progress: `turn`, `thinking`, `call`, `result`, `hold`, `hold_resolved`, `filter`, `note`, `error`, `turn_done` |
+| `POST /api/chats/{id}/holds/{hold_id}` | Body `{"decision": "approve"}` or `{"decision": "deny"}` |
+| `POST /api/chats/{id}/cancel` | Stop the turn in progress |
+| `GET /api/history` | Past conversations |

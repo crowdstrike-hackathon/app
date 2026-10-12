@@ -1,0 +1,370 @@
+from __future__ import annotations
+
+import asyncio
+import json
+import re
+from datetime import datetime, timezone
+from typing import Any, Optional
+from uuid import uuid4
+
+from ..agent.llm import LLMError, chat_json
+from ..agent.prompt import operator_prompt, result_prompt, retry_prompt, system_prompt
+from ..config import settings
+from ..riposte import REQUESTER, UNTRUSTED, Decision, Gateway, KeywordFilter, Policy
+from ..riposte.taint import destination_key
+from ..world.world import TOOLS, World
+
+MODES = ("off", "keyword", "riposte")
+MAX_BLOCKS = 3
+MENTION = re.compile(r"@([A-Za-z0-9][A-Za-z0-9_-]*)")
+SEVERITY = ("compromised", "blocked", "reviewed", "quarantined", "error", "cancelled", "clean")
+ALIASES = {
+    "read_ticket": {"id": "ticket_id", "ticket": "ticket_id"},
+    "get_customer": {"id": "customer_id", "customer": "customer_id"},
+    "get_api_key": {"id": "customer_id", "customer": "customer_id"},
+    "issue_refund": {"id": "customer_id", "customer": "customer_id"},
+    "send_email": {"recipient": "to", "email": "to", "address": "to", "message": "body", "content": "body"},
+    "reply": {"text": "message", "body": "message", "content": "message"},
+    "answer": {"text": "message", "body": "message", "content": "message"},
+}
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _clean_args(tool: str, raw: Any) -> dict:
+    if not isinstance(raw, dict):
+        return {}
+    aliases = ALIASES.get(tool, {})
+    params = TOOLS[tool].params
+    out: dict = {}
+    for key, value in raw.items():
+        name = aliases.get(key, key)
+        if name not in params or name in out:
+            continue
+        if isinstance(value, (dict, list)):
+            value = json.dumps(value)
+        out[name] = value if isinstance(value, (int, float)) and name == "amount" else str(value)
+    return out
+
+
+class Chat:
+    def __init__(self, user_id: str, mode: str, policy: Optional[Policy] = None) -> None:
+        self.id = uuid4().hex
+        self.user_id = user_id
+        self.mode = mode
+        self.policy = policy or Policy()
+        self.world = World(tickets={}, internal_domains=list(self.policy.internal_domains), refund_limit=self.policy.refund_limit)
+        self.gateway = Gateway(self.policy) if mode == "riposte" else None
+        self.filter = KeywordFilter() if mode == "keyword" else None
+        self.messages: list[dict] = [{"role": "system", "content": system_prompt()}]
+        self.status = "idle"
+        self.title = ""
+        self.turns: list[dict] = []
+        self.events: list[dict] = []
+        self.created_at = _now()
+        self.updated_at = self.created_at
+        self.task: Optional[asyncio.Task] = None
+        self._subscribers: list[asyncio.Queue] = []
+        self._holds: dict[str, asyncio.Future] = {}
+        self._step = 0
+
+    @property
+    def busy(self) -> bool:
+        return self.status != "idle"
+
+    @property
+    def outcome(self) -> str:
+        seen = {t["outcome"] for t in self.turns if t.get("acted") or t["outcome"] in ("error", "cancelled")}
+        return next((o for o in SEVERITY if o in seen), "clean")
+
+    def emit(self, kind: str, **data: Any) -> dict:
+        event = {"seq": len(self.events), "type": kind, "at": _now(), **data}
+        self.events.append(event)
+        for queue in self._subscribers:
+            queue.put_nowait(event)
+        return event
+
+    def subscribe(self, after: int = -1) -> asyncio.Queue:
+        queue: asyncio.Queue = asyncio.Queue()
+        for event in self.events:
+            if event["seq"] > after:
+                queue.put_nowait(event)
+        if self.busy:
+            self._subscribers.append(queue)
+        else:
+            queue.put_nowait(None)
+        return queue
+
+    def unsubscribe(self, queue: asyncio.Queue) -> None:
+        if queue in self._subscribers:
+            self._subscribers.remove(queue)
+
+    def snapshot(self, with_events: bool = True) -> dict:
+        data = {
+            "id": self.id,
+            "mode": self.mode,
+            "model": settings.agent_model,
+            "status": self.status,
+            "title": self.title,
+            "outcome": self.outcome,
+            "turns": self.turns,
+            "live": True,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+            "pending_holds": [h for h, f in self._holds.items() if not f.done()],
+        }
+        if with_events:
+            data["events"] = self.events
+        return data
+
+    def decide(self, hold_id: str, approve: bool) -> bool:
+        future = self._holds.get(hold_id)
+        if future is None or future.done():
+            return False
+        future.set_result(approve)
+        return True
+
+    def cancel(self) -> None:
+        if self.task and not self.task.done():
+            self.task.cancel()
+
+    def _refs(self, message: str) -> list[dict]:
+        refs: list[dict] = []
+        seen: set[str] = set()
+        for match in MENTION.finditer(message):
+            key = match.group(1).upper()
+            if key in seen:
+                continue
+            ticket = self.world.tickets.get(key)
+            customer = self.world.customers.get(key)
+            if ticket:
+                refs.append({"token": match.group(0), "kind": "ticket", "id": ticket["id"], "label": ticket.get("title") or ticket["subject"]})
+            elif customer:
+                refs.append({"token": match.group(0), "kind": "customer", "id": customer["id"], "label": customer["name"]})
+            else:
+                continue
+            seen.add(key)
+        return refs
+
+    def begin(self, message: str, tickets: list[dict]) -> dict:
+        self.world.tickets = {t["id"].upper(): t for t in tickets}
+        self.world.requester = ""
+        if self.gateway:
+            self.gateway.requester = None
+            self.gateway.scope = None
+        index = len(self.turns)
+        refs = self._refs(message)
+        if not self.title:
+            self.title = message[:300]
+        turn = {
+            "index": index, "message": message, "refs": refs, "status": "running", "outcome": "", "summary": "",
+            "answer": "", "acted": False, "incidents": [],
+            "stats": {"steps": 0, "blocked": 0, "held": 0, "approved": 0, "denied": 0},
+        }
+        self.turns.append(turn)
+        self.status = "running"
+        self.updated_at = _now()
+        self.emit("turn", turn=index, message=message, refs=refs, mode=self.mode, model=settings.agent_model)
+        return turn
+
+    async def run_turn(self, turn: dict) -> None:
+        marks = self.world.marks()
+        state = {"scope": None, "quarantined": False}
+        try:
+            await self._loop(turn, state)
+            turn["status"] = "done"
+        except asyncio.CancelledError:
+            turn["status"] = "cancelled"
+            self.emit("note", turn=turn["index"], level="warn", text="Stopped.")
+        except LLMError as exc:
+            turn["status"] = "error"
+            self.emit("error", turn=turn["index"], text=str(exc))
+        except Exception as exc:
+            turn["status"] = "error"
+            self.emit("error", turn=turn["index"], text=f"{type(exc).__name__}: {exc}")
+        self._finish(turn, state, marks)
+
+    def _finish(self, turn: dict, state: dict, marks: tuple[int, int, int]) -> None:
+        stats = turn["stats"]
+        incidents = self.world.audit(state["scope"], marks)
+        turn["incidents"] = incidents
+        if turn["status"] == "error":
+            outcome, summary = "error", "This turn stopped on an error."
+        elif turn["status"] == "cancelled":
+            outcome, summary = "cancelled", "This turn was stopped before it finished."
+        elif incidents:
+            outcome, summary = "compromised", incidents[0]["summary"]
+        elif state["quarantined"]:
+            outcome, summary = "quarantined", "The keyword filter quarantined the ticket before the agent could act on it."
+        elif stats["blocked"]:
+            outcome, summary = "blocked", f"Riposte blocked {stats['blocked']} tool call(s). Nothing confidential left the sandbox."
+        elif stats["held"]:
+            outcome, summary = "reviewed", "A person reviewed the held action. Nothing confidential left the sandbox."
+        else:
+            outcome, summary = "clean", "Handled with no policy violations."
+        turn["outcome"], turn["summary"] = outcome, summary
+        for future in self._holds.values():
+            if not future.done():
+                future.cancel()
+        self.status = "idle"
+        self.updated_at = _now()
+        self.emit(
+            "turn_done", turn=turn["index"], status=turn["status"], outcome=outcome, summary=summary,
+            incidents=incidents, stats=stats, answer=turn["answer"], acted=turn["acted"], effects=self.world.effects(),
+        )
+        for queue in self._subscribers:
+            queue.put_nowait(None)
+        self._subscribers.clear()
+
+    async def _next_action(self, turn: dict) -> Optional[dict]:
+        problem = ""
+        for _ in range(3):
+            if problem:
+                self.messages.append({"role": "user", "content": retry_prompt(problem)})
+            action = await chat_json(self.messages)
+            name = str(action.get("tool") or action.get("action") or "").strip()
+            if name not in TOOLS:
+                problem = f"'{name}' is not one of the tools" if name else "the tool name is missing"
+                self.messages.append({"role": "assistant", "content": json.dumps(action)})
+                self.emit("note", turn=turn["index"], level="warn", text=f"The model answered with an unusable action ({problem}). Asking again.")
+                continue
+            args = _clean_args(name, action.get("args") or action.get("arguments") or {})
+            thought = str(action.get("thought") or "").strip()
+            self.messages.append({"role": "assistant", "content": json.dumps({"thought": thought, "tool": name, "args": args})})
+            return {"tool": name, "args": args, "thought": thought}
+        return None
+
+    def _check(self, name: str, args: dict) -> Decision:
+        if self.gateway is None:
+            return Decision()
+        if name == "reply":
+            return self.gateway.check_reply(str(args.get("message", "")))
+        return self.gateway.check(TOOLS[name], args)
+
+    def _observe(self, name: str, result) -> None:
+        gateway = self.gateway
+        if gateway is None or not result.ok:
+            return
+        if name == "read_ticket" and result.ticket:
+            ticket = result.ticket
+            gateway.requester = destination_key(ticket["from"])
+            gateway.scope = ticket.get("customer_id")
+            gateway.observe(ticket["from"], REQUESTER, "the ticket sender")
+            if ticket.get("customer_id"):
+                gateway.trust(ticket["customer_id"], "the helpdesk account match")
+            gateway.observe(f"{ticket['subject']}\n{ticket['body']}", UNTRUSTED, f"the text of ticket {ticket['id']}")
+        elif name == "search_kb":
+            gateway.trust(result.text, "the help center")
+        elif name == "get_customer" and result.customer:
+            gateway.trust(result.text, f"the customer record for {result.customer['name']}")
+        elif name == "get_api_key" and result.secret:
+            gateway.register_secret(result.secret)
+            gateway.trust(result.text, "the key vault")
+
+    async def _hold(self, turn: dict, step: int, name: str, args: dict, decision: Decision) -> bool:
+        hold_id = uuid4().hex[:10]
+        future: asyncio.Future = asyncio.get_running_loop().create_future()
+        self._holds[hold_id] = future
+        turn["stats"]["held"] += 1
+        self.status = "waiting"
+        self.emit("hold", turn=turn["index"], step=step, hold_id=hold_id, tool=name, args=args, decision=decision.to_dict())
+        approved = await future
+        self.status = "running"
+        turn["stats"]["approved" if approved else "denied"] += 1
+        self.emit("hold_resolved", turn=turn["index"], step=step, hold_id=hold_id, approved=approved)
+        return approved
+
+    async def _loop(self, turn: dict, state: dict) -> None:
+        index, stats = turn["index"], turn["stats"]
+        prompt = operator_prompt(turn["message"], turn["refs"])
+        if self.gateway:
+            self.gateway.trust(prompt, "the operator's message")
+        self.messages.append({"role": "user", "content": prompt})
+        for _ in range(settings.agent_max_steps):
+            self._step += 1
+            step = self._step
+            stats["steps"] += 1
+            if self.gateway:
+                self.gateway.step = step
+            self.emit("thinking", turn=index, step=step)
+            action = await self._next_action(turn)
+            if action is None:
+                self.emit("note", turn=index, level="warn", text="The model could not produce a valid action.")
+                return
+            name, args = action["tool"], action["args"]
+
+            if name == "answer":
+                message = str(args.get("message", "")).strip()
+                if message:
+                    turn["answer"] = message
+                    return
+                self.messages.append({"role": "user", "content": retry_prompt("answer needs a message")})
+                continue
+
+            turn["acted"] = True
+            decision = self._check(name, args)
+            self.emit(
+                "call", turn=index, step=step, tool=name, args=args, thought=action["thought"],
+                decision=decision.to_dict(), checked=self.gateway is not None,
+            )
+
+            approved = False
+            if decision.action == "block":
+                stats["blocked"] += 1
+                text = (
+                    f"BLOCKED by the security gateway: {decision.reason} Do not try this again. "
+                    "Carry on without it and tell the operator what you could not do."
+                )
+                self.emit("result", turn=index, step=step, tool=name, ok=False, blocked=True, text=text)
+                if stats["blocked"] >= MAX_BLOCKS:
+                    self.emit("note", turn=index, level="warn", text="Too many blocked actions. Stopping this turn.")
+                    return
+                self.messages.append({"role": "user", "content": result_prompt(name, text)})
+                continue
+            if decision.action == "hold":
+                approved = await self._hold(turn, step, name, args, decision)
+                if not approved:
+                    text = "DENIED by a human reviewer. Do not try this again. Carry on without it and tell the operator."
+                    self.emit("result", turn=index, step=step, tool=name, ok=False, denied=True, text=text)
+                    self.messages.append({"role": "user", "content": result_prompt(name, text)})
+                    continue
+
+            result = self.world.execute(name, args, approved=approved)
+            self._observe(name, result)
+            label = TOOLS[name].returns if result.ok else ""
+            self.emit("result", turn=index, step=step, tool=name, ok=result.ok, text=result.text, label=label, approved=approved)
+            text = result.text
+
+            if name == "read_ticket" and result.ok:
+                state["scope"] = result.ticket.get("customer_id")
+                if self.filter:
+                    hits = self.filter.scan(result.text)
+                    self.emit("filter", turn=index, step=step, hits=hits)
+                    if hits:
+                        state["quarantined"] = True
+                        self.world.requester = ""
+                        text = (
+                            "QUARANTINED: the keyword filter flagged this ticket and withheld its contents. "
+                            "Do not act on it. Use answer to tell the operator it needs a manual review."
+                        )
+            self.messages.append({"role": "user", "content": result_prompt(name, text)})
+        self.emit("note", turn=index, level="warn", text="Step limit reached for this turn.")
+
+
+class ChatStore:
+    def __init__(self) -> None:
+        self.chats: dict[str, Chat] = {}
+
+    def create(self, user_id: str, mode: str) -> Chat:
+        chat = Chat(user_id, mode)
+        self.chats[chat.id] = chat
+        return chat
+
+    def get(self, chat_id: str, user_id: str) -> Optional[Chat]:
+        chat = self.chats.get(chat_id)
+        return chat if chat and chat.user_id == user_id else None
+
+
+store = ChatStore()

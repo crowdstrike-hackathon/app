@@ -14,7 +14,7 @@ class Settings(BaseSettings):
     agent_base_url: str = "http://localhost:11434/v1"
     agent_model: str = "llama3.2:3b"
     agent_api_key: str = "ollama"
-    agent_max_steps: int = 8
+    agent_max_steps: int = 10
     agent_timeout_seconds: float = 90.0
 
     tickets_path: str = "tickets.json"
